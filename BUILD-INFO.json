@@ -1,0 +1,16 @@
+{
+  "product": "CtxMeter",
+  "publicVersion": "1.2.0",
+  "maintenanceVersion": "1.2.0+ctx.1",
+  "directBaseline": "1.1.0+sean.2",
+  "upstreamVersion": "3.1.7",
+  "date": "2026-10-08",
+  "distributionPackage": "ctxmeter-1.2.0.zip",
+  "summaryStyles": ["clear", "capsule", "stacked"],
+  "defaultSummaryStyle": "clear",
+  "iconRevision": 3,
+  "includesTopbarLayout": true,
+  "includesContextReminders": true,
+  "includesCompactProgress": true,
+  "automaticUpstreamUpdates": false
+}
