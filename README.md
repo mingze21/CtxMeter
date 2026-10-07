@@ -61,7 +61,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 这是结合两款软件的长处、再按 SEAN 使用需求改进的独立项目：
 
 1. **Codex Usage Monitor for Windows**：以 [JiaYang-BUAA/Codex-Desktop-Usage-Monitor-Windows v3.1.7](https://github.com/JiaYang-BUAA/Codex-Desktop-Usage-Monitor-Windows) 为代码基础，延续用量采集、订阅额度、设置面板及 Windows 启动流程。
-2. **Nudge**：借鉴紧凑上下文进度指示、红黄绿状态，以及及时保存结论和切换会话的提醒思路。本项目未打包 Nudge 的程序、源码、图标或品牌素材。
+2. **[Nudge](https://github.com/yuxinz77/nudge-ai)**：借鉴紧凑上下文进度指示、红黄绿状态，以及及时保存结论和切换会话的提醒思路。本项目未打包 Nudge 的程序、源码、图标或品牌素材。
 3. **SEAN 的改进**：顶部布局、当前聊天上下文估算、中文行动提示、统一状态色、三种可选样式、数字与重置时间的可读性、独立图标与手动更新策略。
 
 感谢原项目及相关工具的启发。保留原项目 MIT 许可证和必要归因；安装包中的 `LICENSE` 与 `NOTICE.md` 记录完整说明。
