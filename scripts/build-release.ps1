@@ -17,9 +17,9 @@ if (-not $OutputDirectory) { $OutputDirectory = Join-Path $root 'dist' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
-$releaseName = "sean-context-monitor-$version"
+$releaseName = "ctxmeter-$version"
 $archivePath = Join-Path $OutputDirectory "$releaseName.zip"
-$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) "sean-context-monitor-build-$PID"
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) "ctxmeter-build-$PID"
 $packageRoot = Join-Path $temporaryRoot $releaseName
 $manifestPath = if ($ManifestPath) { [IO.Path]::GetFullPath($ManifestPath) } else { Join-Path $root 'config\package-files.json' }
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json

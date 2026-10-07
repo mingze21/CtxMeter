@@ -2906,7 +2906,7 @@ class AppServerRpc {
     });
 
     await this.request("initialize", {
-      clientInfo: { name: "sean-context-monitor", title: "SEAN Context Monitor", version: "1.0.0" },
+      clientInfo: { name: "ctxmeter", title: "CtxMeter", version: "1.2.0" },
       capabilities: { optOutNotificationMethods: [] },
     });
     this.notify("initialized");

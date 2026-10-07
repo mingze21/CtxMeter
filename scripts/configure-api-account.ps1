@@ -48,5 +48,5 @@ if ($activePort) {
   if ($LASTEXITCODE -ne 0) { throw "配置成功，但重启监视器失败，退出码 $LASTEXITCODE。" }
   Write-Host 'API 账户已配置，监视器已重新加载。'
 } else {
-  Write-Host 'API 账户已配置；下次从 SEAN Context Monitor 快捷方式启动时生效。'
+  Write-Host 'API 账户已配置；下次从 CtxMeter 快捷方式启动时生效。'
 }

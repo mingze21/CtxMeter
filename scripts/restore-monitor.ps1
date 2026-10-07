@@ -23,4 +23,4 @@ foreach ($statePath in @($CodexUsageStatePath, $CodexUsageLegacyStatePath)) {
 if (Test-Path -LiteralPath $CodexUsageStateRoot -PathType Container) {
   Get-ChildItem -LiteralPath $CodexUsageStateRoot -File -Filter 'injector-*.log' | Remove-Item -Force -ErrorAction SilentlyContinue
 }
-Write-Host 'SEAN Context Monitor已停止并从当前 renderer 移除。'
+Write-Host 'CtxMeter已停止并从当前 renderer 移除。'

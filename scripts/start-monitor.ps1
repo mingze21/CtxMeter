@@ -62,7 +62,7 @@ if (-not $activePort) {
   }
 }
 if (-not $activePort) {
-  if (-not $LaunchCodex) { throw '没有找到带 CDP 的 Codex。请先使用“SEAN Context Monitor”快捷方式启动 Codex。' }
+  if (-not $LaunchCodex) { throw '没有找到带 CDP 的 Codex。请先使用“CtxMeter”快捷方式启动 Codex。' }
   if (@(Get-Process ChatGPT -ErrorAction SilentlyContinue).Count -gt 0) {
     throw 'Codex 已经运行但未开放 CDP。请正常退出后再使用监视器启动器；脚本不会强制结束现有会话。'
   }
@@ -87,7 +87,7 @@ if (-not $Replace) {
       $state | Add-Member -NotePropertyName startupVerifiedAt -NotePropertyValue (Get-Date).ToString('o') -Force
       Write-CodexUsageState $state
       Stop-CodexUsagePreviousInjectors $owned $candidate.ProcessId $true
-      Write-Host "SEAN Context Monitor已在端口 $Port 运行（PID $($candidate.ProcessId)）。"
+      Write-Host "CtxMeter已在端口 $Port 运行（PID $($candidate.ProcessId)）。"
       return
     }
     Write-Host "监视器后台正在等待 Codex 界面就绪（端口 $Port，PID $($candidate.ProcessId)）；已复用等待中的后台，不重复启动。"
@@ -148,7 +148,7 @@ if (-not $verified) {
   Write-Host "监视器后台已启动，正在等待 Codex 界面加载（端口 $Port，PID $($daemon.Id)）。后台会继续重试，原监视器暂时保留。"
   return
 }
-Write-Host "SEAN Context Monitor已启动：端口 $Port，PID $($daemon.Id)。"
+Write-Host "CtxMeter已启动：端口 $Port，PID $($daemon.Id)。"
 } finally {
   if ($mutexAcquired) { try { $mutex.ReleaseMutex() } catch {} }
   $mutex.Dispose()

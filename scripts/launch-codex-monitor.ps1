@@ -52,7 +52,7 @@ if ($SelfTest) {
 function Show-CodexMonitorMessage([string]$Message, [string]$Icon = 'Information') {
   try {
     Add-Type -AssemblyName PresentationFramework
-    [void][System.Windows.MessageBox]::Show($Message, 'SEAN Context Monitor', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::$Icon)
+    [void][System.Windows.MessageBox]::Show($Message, 'CtxMeter', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::$Icon)
   } catch { Write-Error $Message }
 }
 
@@ -81,7 +81,7 @@ try {
   }
   $plan = Get-CodexMonitorLaunchPlan $debugReady $codexRunning
   if ($plan -eq 'blocked-running-without-cdp') {
-    Show-CodexMonitorMessage 'Codex 已通过原生入口运行，无法在不中断会话的情况下补加监视端口。请先正常退出 Codex，再点击“SEAN Context Monitor”。' 'Warning'
+    Show-CodexMonitorMessage 'Codex 已通过原生入口运行，无法在不中断会话的情况下补加监视端口。请先正常退出 Codex，再点击“CtxMeter”。' 'Warning'
     exit 2
   }
   if ($debugReady) { $Port = $activePort }

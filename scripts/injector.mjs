@@ -464,7 +464,7 @@ async function runWatch(options) {
   const sessions = new Map();
   const settingsStore = await createUiSettingsStore();
   const autoResumeStore = await createAutoResumeStateStore();
-  // Independent SEAN builds are updated manually; never run the upstream updater.
+  // Independent CtxMeter builds are updated manually; never run the upstream updater.
   let usageClient = null;
   let latestBaseUsage = null;
   let latestUsage = null;

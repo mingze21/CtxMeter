@@ -2,10 +2,10 @@
 param(
   [ValidateRange(1024, 65535)]
   [int]$Port = 9335,
-  [string]$ShortcutName = 'SEAN Context Monitor.lnk',
+  [string]$ShortcutName = 'CtxMeter.lnk',
   [string]$DestinationDirectory = [Environment]::GetFolderPath('Desktop'),
-  [string]$IconCachePath = (Join-Path $env:LOCALAPPDATA 'CodexUsageMonitor\sean-context-monitor-sean2.ico'),
-  [string]$IconSourcePath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'docs\images\sean-context-monitor-icon.png')
+  [string]$IconCachePath = (Join-Path $env:LOCALAPPDATA 'CodexUsageMonitor\ctxmeter-ctx1.ico'),
+  [string]$IconSourcePath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'docs\images\ctxmeter-icon.png')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,7 +96,7 @@ $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $wscript
 $shortcut.Arguments = "`"$hiddenLauncher`" `"$pwsh`" $Port"
 $shortcut.WorkingDirectory = $root
-$shortcut.Description = 'SEAN Context Monitor — 启动 Codex 并显示上下文与用量提醒'
+$shortcut.Description = 'CtxMeter — 启动 Codex 并显示上下文与用量提醒'
 $shortcut.IconLocation = "$iconPath,0"
 $shortcut.WindowStyle = 7
 $shortcut.Save()
@@ -120,5 +120,17 @@ namespace CodexUsageMonitorShell {
 $legacyShortcutPath = Join-Path $DestinationDirectory 'Codex 监视器版.lnk'
 if ($legacyShortcutPath -ne $shortcutPath -and (Test-Path -LiteralPath $legacyShortcutPath -PathType Leaf)) {
   Remove-Item -LiteralPath $legacyShortcutPath -Force
+}
+$previousProductShortcutPath = Join-Path $DestinationDirectory 'SEAN Context Monitor.lnk'
+if ($previousProductShortcutPath -ne $shortcutPath -and (Test-Path -LiteralPath $previousProductShortcutPath -PathType Leaf)) {
+  try {
+    $previousProductShortcut = $shell.CreateShortcut($previousProductShortcutPath)
+    if ([IO.Path]::GetFileName($previousProductShortcut.TargetPath) -ieq 'wscript.exe' -and
+      $previousProductShortcut.Arguments -match '^"[^"]+[\\/]scripts[\\/]launch-codex-monitor-hidden\.vbs"(?:\s|$)') {
+      Remove-Item -LiteralPath $previousProductShortcutPath -Force
+    }
+  } catch {
+    Write-Warning '旧版 SEAN Context Monitor 快捷方式未能移除；CtxMeter 快捷方式已创建。'
+  }
 }
 Write-Host "已创建桌面快捷方式：$shortcutPath"
