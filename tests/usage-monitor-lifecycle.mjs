@@ -341,7 +341,7 @@ try {
   assert.equal(host.shadowRoot.querySelector('[data-source="acme"][data-metric="requestStatus"]')?.closest(".usage-detail-row")?.querySelector(".usage-detail-value")?.textContent, "请求受限");
   assert.equal(window.__CODEX_USAGE_MONITOR_STATE__.updateUsage(usage), true);
   assert.equal(host.shadowRoot.querySelectorAll('input[data-metric]:checked').length, 5);
-  assert.deepEqual([...columns[1].querySelectorAll(".usage-column-brand > *")].map((item) => item.textContent), [`SEAN Context Monitor v${version}`]);
+  assert.deepEqual([...columns[1].querySelectorAll(".usage-column-brand > *")].map((item) => item.textContent), [`CtxMeter v${version}`]);
   assert.match(host.shadowRoot.querySelector("style").textContent, /\.usage-column-brand\s*\{[\s\S]*?align-self:\s*flex-end;[\s\S]*?width:\s*fit-content;[\s\S]*?margin:\s*0 8px 0 0;[\s\S]*?font-weight:\s*450;[\s\S]*?opacity:\s*\.55;/);
   assert.match(host.shadowRoot.querySelector("style").textContent, /\.usage-brand-product\s*\{[^}]*font-size:\s*12px;/);
   assert.equal(host.shadowRoot.querySelector(".usage-brand-credit"), null);
@@ -1186,7 +1186,8 @@ try {
     assert.equal(monitor.getSettings().contextReminders, true, "context reminders default on");
     host.shadowRoot.querySelector(".usage-summary").click();
     assert.equal(host.shadowRoot.querySelector(".usage-popover").hidden, false);
-    assert.equal(contextSummary().querySelector(".usage-context-mark").textContent, "S");
+    assert.ok(contextSummary().querySelector(".usage-context-mark svg path"), "the rounded product mark uses a compact vector icon");
+    assert.equal(contextSummary().querySelector(".usage-context-mark").getAttribute("aria-hidden"), "true");
     assert.ok(contextSummary().querySelector(".usage-context-meter"));
     assert.equal(contextSummary().querySelector(".usage-context-dot"), null, "compact meter replaces the leading dot");
     assert.equal(host.shadowRoot.querySelector(".usage-refresh-ring").hidden, true, "context meter hides the separate countdown icon");

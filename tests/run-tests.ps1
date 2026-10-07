@@ -25,7 +25,7 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
   $lockVersion = $serializer.DeserializeObject((Get-Content -LiteralPath $lockPath -Raw))['version']
 }
 $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
-if ($package.name -ne 'sean-context-monitor') { throw 'Unexpected package name.' }
+if ($package.name -ne 'ctxmeter') { throw 'Unexpected package name.' }
 if ($package.version -ne $version -or $lockVersion -ne $version) { throw 'VERSION, package.json, and package-lock.json must match.' }
 $rendererConstants = Get-Content -LiteralPath (Join-Path $root 'assets\usage-constants.js') -Raw
 $rendererVersionMatch = [regex]::Match($rendererConstants, 'VERSION:\s*"([^"]+)"')
@@ -215,7 +215,7 @@ if ($runtimeSource -notmatch 'LOCAL_TOKEN_IDLE_SCAN_MS\s*=\s*12000' -or $runtime
 if ($runtimeSource -match '(?i)dream[ -]?skin|CODEX_DREAM|codex-dream') { throw 'Removed Dream Skin runtime compatibility is still present.' }
 if ($runtimeSource -notmatch 'runtimeVersion') { throw 'Runtime version state contract is missing.' }
 if ($runtimeSource -notmatch '--remote-debugging-address=127\.0\.0\.1') { throw 'Local CDP binding contract is missing.' }
-if ($runtimeSource -notmatch 'SEAN Context Monitor\.lnk') { throw 'English shortcut name contract is missing.' }
+if ($runtimeSource -notmatch 'CtxMeter\.lnk') { throw 'English shortcut name contract is missing.' }
 if ($runtimeSource -notmatch 'launch-codex-monitor-hidden\.vbs') { throw 'Hidden launcher contract is missing.' }
 if ($runtimeSource -notmatch 'Resolve-CodexUsageRunnableCliPath') { throw 'Store Codex CLI mirroring contract is missing.' }
 if ($runtimeSource -notmatch '-ExecutionPolicy Bypass') { throw 'Hidden launcher execution-policy bypass is missing.' }
@@ -241,7 +241,7 @@ foreach ($requiredGuideText in @('install\.ps1', 'Never ask.*API key', 'WindowsA
   if ($agentGuide -notmatch $requiredGuideText) { throw "Codex installation guide is missing: $requiredGuideText" }
 }
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw -Encoding UTF8
-foreach ($requiredReadmeText in @('SEAN Context Monitor', '1.0.0', '上下文', '70%', '85%', '保存结论', '换会话', '估算', 'docs/data-sources.md', 'docs/troubleshooting.md', 'AGENTS.md', 'install.ps1', '本会话', 'API 账户', 'API Key', '累计 Token 基准', '极简模式', '倒计时可视化', '手动更新', 'CodexUsageMonitor', 'LICENSE', 'NOTICE.md')) {
+foreach ($requiredReadmeText in @('CtxMeter', $version, '上下文', '70%', '85%', '保存结论', '换会话', '估算', 'docs/data-sources.md', 'docs/troubleshooting.md', 'AGENTS.md', 'install.ps1', '本会话', 'API 账户', 'API Key', '累计 Token 基准', '极简模式', '倒计时可视化', '手动更新', 'CodexUsageMonitor', 'LICENSE', 'NOTICE.md')) {
   if ($readme -notmatch [regex]::Escape($requiredReadmeText)) { throw "README installation guidance is missing: $requiredReadmeText" }
 }
 
@@ -251,7 +251,7 @@ foreach ($requiredDataSourceText in @('official-token-counter.json', '本机实�
 }
 
 $troubleshootingGuide = Get-Content -LiteralPath (Join-Path $root 'docs\troubleshooting.md') -Raw -Encoding UTF8
-foreach ($requiredTroubleshootingText in @('state.json', '动态端口', 'launcher-error.log', '-Replace', 'SEAN Context Monitor')) {
+foreach ($requiredTroubleshootingText in @('state.json', '动态端口', 'launcher-error.log', '-Replace', 'CtxMeter')) {
   if ($troubleshootingGuide -notmatch [regex]::Escape($requiredTroubleshootingText)) { throw "Troubleshooting guide is missing: $requiredTroubleshootingText" }
 }
 
@@ -335,7 +335,7 @@ if (-not $SkipPackageTest) {
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
     $archive = Get-ChildItem -LiteralPath $testRoot -Filter '*.zip' -File | Select-Object -First 1
     if (-not $archive) { throw 'Release archive was not created.' }
-    if ($archive.Name -ne "sean-context-monitor-$version.zip") { throw 'Release archive must use the SEAN product name.' }
+    if ($archive.Name -ne "ctxmeter-$version.zip") { throw 'Release archive must use the CtxMeter product name.' }
     if ($archive.Length -gt 750KB) { throw "Release archive is unexpectedly large: $($archive.Length) bytes." }
     $extract = Join-Path $testRoot 'extract'
     Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extract
@@ -355,7 +355,7 @@ if (-not $SkipPackageTest) {
       if ($text -match $pattern) { throw "Potential secret or personal path found in release: $pattern" }
     }
     if ($actual -match 'themes|renderer-inject|\.exe$|theme-manager|build-exe') { throw 'Theme or executable content leaked into the release.' }
-    foreach ($imagePath in @('docs\images\sean-context-monitor-icon.png', 'assets\sean-context-monitor.svg')) {
+    foreach ($imagePath in @('docs\images\ctxmeter-icon.png', 'assets\ctxmeter.svg')) {
       if ($actual -notcontains $imagePath) { throw "Product icon is missing from the release: $imagePath" }
     }
 
@@ -381,6 +381,12 @@ if (-not $SkipPackageTest) {
     $shortcutDirectory = Join-Path $testRoot 'desktop'
     New-Item -ItemType Directory -Force -Path $shortcutDirectory | Out-Null
     Set-Content -LiteralPath (Join-Path $shortcutDirectory 'Codex 监视器版.lnk') -Value 'legacy' -Encoding ascii
+    $previousProductShortcutPath = Join-Path $shortcutDirectory 'SEAN Context Monitor.lnk'
+    $shortcutShell = New-Object -ComObject WScript.Shell
+    $previousProductShortcut = $shortcutShell.CreateShortcut($previousProductShortcutPath)
+    $previousProductShortcut.TargetPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $previousProductShortcut.Arguments = '"C:\PreviousMonitor\scripts\launch-codex-monitor-hidden.vbs" "C:\PowerShell\pwsh.exe" 9335'
+    $previousProductShortcut.Save()
     $shortcutIconSource = Join-Path $testRoot 'shortcut-icon-source.png'
     Add-Type -AssemblyName System.Drawing
     $testIconBitmap = [Drawing.Bitmap]::new(256, 256, [Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -397,7 +403,7 @@ if (-not $SkipPackageTest) {
     }
     $shortcutIcon = Join-Path $testRoot 'shortcut-icon\codex-usage-monitor-v2.ico'
     & (Join-Path $root 'scripts\install-monitor-launcher.ps1') -DestinationDirectory $shortcutDirectory -IconCachePath $shortcutIcon -IconSourcePath $shortcutIconSource
-    $shortcutPath = Join-Path $shortcutDirectory 'SEAN Context Monitor.lnk'
+    $shortcutPath = Join-Path $shortcutDirectory 'CtxMeter.lnk'
 
     $installedVbs = Join-Path $installedDirectory 'scripts\launch-codex-monitor-hidden.vbs'
     $fakePowerShell = Join-Path $testRoot 'fake-powershell.cmd'
@@ -443,6 +449,12 @@ if (-not $SkipPackageTest) {
     if ([IO.Path]::GetFullPath($shortcutIconLocation) -ne [IO.Path]::GetFullPath($shortcutIcon)) { throw 'Shortcut does not use the stable cached icon.' }
     if ($shortcut.IconLocation -match '(?i)[\\/]WindowsApps[\\/]') { throw 'Shortcut icon must not reference a versioned WindowsApps path.' }
     if (Test-Path -LiteralPath (Join-Path $shortcutDirectory 'Codex 监视器版.lnk')) { throw 'Legacy shortcut was not removed.' }
+    if (Test-Path -LiteralPath $previousProductShortcutPath) { throw 'Previous product launcher shortcut was not migrated.' }
+    $unrelatedShortcut = $shortcutShell.CreateShortcut($previousProductShortcutPath)
+    $unrelatedShortcut.TargetPath = Join-Path $env:SystemRoot 'System32\notepad.exe'
+    $unrelatedShortcut.Save()
+    & (Join-Path $root 'scripts\install-monitor-launcher.ps1') -DestinationDirectory $shortcutDirectory -IconCachePath $shortcutIcon -IconSourcePath $shortcutIconSource
+    if (-not (Test-Path -LiteralPath $previousProductShortcutPath)) { throw 'An unrelated shortcut with the old product name must be preserved.' }
   } finally {
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
   }
