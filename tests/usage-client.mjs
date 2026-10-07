@@ -1,0 +1,1730 @@
+import assert from "node:assert/strict";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  ApiAccountUsageClient,
+  ApiUsageClient,
+  ResetForecastClient,
+  TIBO_ACTIVITY_REFRESH_MS,
+  LocalCodexTokenTracker,
+  CombinedUsageClient,
+  accountLogIdentity,
+  loadApiProviderConfig,
+  mergeRateLimitSnapshot,
+  mergeOfficialLocalUsage,
+  normalizeApiUsageView,
+  normalizeApiAccountView,
+  normalizeCctqUsageView,
+  normalizeCredentialBaseUrl,
+  normalizeResetForecastView,
+  normalizeUsageView,
+  conversationTokenDelta,
+  officialModelProvidersFromAccount,
+  parseAppServerLine,
+  parseLocalContextCompactionEvent,
+  parseLocalContextWindowEvent,
+  parseLocalQuotaExceededEvent,
+  parseLocalTaskCompleteEvent,
+  parseLocalTaskStartedEvent,
+  parseLocalTurnAbortedEvent,
+  parseLocalTokenContextEvent,
+  parseLocalTokenUsageEvent,
+  parseUsageLimitResetAt,
+  sessionTokenDelta,
+  toOfficialUsageSource,
+  toSessionUsageSource,
+  validateApiProviderConfig,
+} from "../scripts/usage-client.mjs";
+import { localTokenNextScanDelay } from "../scripts/usage/scheduling.mjs";
+
+assert.equal(localTokenNextScanDelay({ now: 20000, lastActivityAt: 10000, activeScanMs: 2000, idleScanMs: 12000, activeWindowMs: 15000 }), 2000);
+assert.equal(localTokenNextScanDelay({ now: 30001, lastActivityAt: 10000, activeScanMs: 2000, idleScanMs: 12000, activeWindowMs: 15000 }), 12000);
+assert.equal(localTokenNextScanDelay({ now: 30001, lastActivityAt: null, activeScanMs: 2000, idleScanMs: 12000, activeWindowMs: 15000 }), 12000);
+
+assert.deepEqual(parseAppServerLine('{"id":1,"result":{}}'), { id: 1, result: {} });
+assert.equal(parseAppServerLine("  "), null);
+assert.throws(() => parseAppServerLine("[]"), /JSON object/);
+assert.throws(() => parseAppServerLine("not-json"), SyntaxError);
+
+const quotaObservedAt = new Date(2026, 7, 30, 14, 0, 0).getTime();
+assert.equal(
+  parseUsageLimitResetAt("You've hit your usage limit. You can try again at Aug 30th, 2026 2:14 AM.", quotaObservedAt),
+  new Date(2026, 7, 30, 2, 14, 0).getTime(),
+);
+assert.equal(
+  parseUsageLimitResetAt("You can try again at 3:21 PM.", quotaObservedAt),
+  new Date(2026, 7, 30, 15, 21, 0).getTime(),
+);
+assert.equal(
+  parseUsageLimitResetAt("You can try again at 3:21 PM.", new Date(2026, 7, 30, 16, 0, 0).getTime()),
+  new Date(2026, 7, 31, 15, 21, 0).getTime(),
+);
+const quotaEvent = parseLocalQuotaExceededEvent(JSON.stringify({
+  timestamp: new Date(quotaObservedAt).toISOString(),
+  type: "event_msg",
+  payload: {
+    type: "task_complete",
+    turn_id: "019fb3b1-2638-7bb0-9a90-ec83b5bca0f3",
+    error: { message: "You can try again at 3:21 PM.", codex_error_info: "usage_limit_exceeded" },
+  },
+}));
+assert.equal(quotaEvent.turnId, "019fb3b1-2638-7bb0-9a90-ec83b5bca0f3");
+assert.equal(quotaEvent.resetAt, new Date(2026, 7, 30, 15, 21, 0).getTime());
+assert.match(quotaEvent.eventId, /^[0-9a-f]{32}$/);
+assert.equal(parseLocalQuotaExceededEvent(JSON.stringify({ type: "event_msg", payload: { type: "task_complete", error: { codex_error_info: "other" } } })), null);
+assert.deepEqual(parseLocalTaskCompleteEvent(JSON.stringify({
+  timestamp: new Date(quotaObservedAt).toISOString(),
+  type: "event_msg",
+  payload: { type: "task_complete", turn_id: "019fb3b1-2638-7bb0-9a90-ec83b5bca0f3", error: null },
+})), {
+  timestamp: quotaObservedAt,
+  turnId: "019fb3b1-2638-7bb0-9a90-ec83b5bca0f3",
+  durationMs: null,
+  errorInfo: null,
+  errorMessage: null,
+});
+assert.deepEqual(parseLocalTurnAbortedEvent(JSON.stringify({
+  timestamp: new Date(quotaObservedAt).toISOString(),
+  type: "event_msg",
+  payload: { type: "turn_aborted", turn_id: "019fb3b1-2638-7bb0-9a90-ec83b5bca0f3", reason: "interrupted" },
+})), {
+  timestamp: quotaObservedAt,
+  turnId: "019fb3b1-2638-7bb0-9a90-ec83b5bca0f3",
+  durationMs: null,
+  reason: "interrupted",
+});
+
+for (const accountType of ["chatgpt", "chatgptAuthTokens", "personalAccessToken"]) {
+  assert.deepEqual(officialModelProvidersFromAccount(
+    { account: { type: accountType }, requiresOpenaiAuth: true },
+    { config: { model_provider: "custom", model_providers: { custom: { requires_openai_auth: true } } } },
+  ), ["custom", "openai"]);
+}
+assert.deepEqual(officialModelProvidersFromAccount(
+  { account: { type: "chatgpt" }, requiresOpenaiAuth: false },
+  { config: { model_provider: "custom", model_providers: { custom: { requires_openai_auth: false } } } },
+), ["openai"]);
+assert.deepEqual(officialModelProvidersFromAccount(
+  { account: { type: "apiKey" }, requiresOpenaiAuth: true },
+  { config: { model_providers: { custom: { requires_openai_auth: true } } } },
+), []);
+
+const rateLimits = {
+  rateLimits: {
+    limitId: "codex",
+    primary: { usedPercent: 32, windowDurationMins: 300, resetsAt: 1784700000 },
+    secondary: { usedPercent: 58, windowDurationMins: 10080, resetsAt: 1785200000 },
+  },
+  rateLimitsByLimitId: {
+    codex: {
+      limitId: "codex",
+      primary: { usedPercent: 32, windowDurationMins: 300, resetsAt: 1784700000 },
+      secondary: { usedPercent: 58, windowDurationMins: 10080, resetsAt: 1785200000 },
+    },
+  },
+};
+const tokenUsage = {
+  summary: { lifetimeTokens: 1250000 },
+  dailyUsageBuckets: [
+    { startDate: "2026-07-15", tokens: 999999 },
+    { startDate: "2026-07-21", tokens: 9000 },
+    { startDate: "2026-07-22", tokens: 18400 },
+  ],
+};
+const now = new Date(2026, 6, 22, 12, 0, 0);
+const view = normalizeUsageView(rateLimits, tokenUsage, now);
+assert.equal(view.status, "ready");
+assert.deepEqual(view.windows, [
+  { label: "5小时", remainingPercent: 68, windowDurationMins: 300, resetsAt: 1784700000, limitId: "codex" },
+  { label: "7天", remainingPercent: 42, windowDurationMins: 10080, resetsAt: 1785200000, limitId: "codex" },
+]);
+assert.equal(view.todayTokens, 18400);
+assert.equal(view.last7DaysTokens, 27400);
+assert.equal(view.lifetimeTokens, 1250000);
+const official = toOfficialUsageSource(view, now.getTime(), 45000);
+const primaryResetDate = new Date(view.windows[0].resetsAt * 1000);
+const secondaryResetDate = new Date(view.windows[1].resetsAt * 1000);
+const padResetPart = (value) => String(value).padStart(2, "0");
+const expectedPrimaryReset = `${padResetPart(primaryResetDate.getMonth() + 1)}-${padResetPart(primaryResetDate.getDate())} ${padResetPart(primaryResetDate.getHours())}:${padResetPart(primaryResetDate.getMinutes())}`;
+const expectedSecondaryReset = `${padResetPart(secondaryResetDate.getMonth() + 1)}-${padResetPart(secondaryResetDate.getDate())} ${padResetPart(secondaryResetDate.getHours())}:${padResetPart(secondaryResetDate.getMinutes())}`;
+assert.deepEqual(official.metrics.filter((item) => item.defaultVisible).map((item) => item.id), ["primaryRemaining", "todayTokens"]);
+assert.equal(official.metrics.find((item) => item.id === "primaryRemaining").label, "5小时剩余");
+assert.equal(official.metrics.find((item) => item.id === "primaryRemaining").value, "68%");
+assert.equal(official.metrics.find((item) => item.id === "primaryRemaining").resetsAt, view.windows[0].resetsAt);
+assert.equal(official.metrics.find((item) => item.id === "secondaryRemaining").label, "7天剩余");
+assert.equal(official.metrics.find((item) => item.id === "secondaryRemaining").value, "42%");
+assert.equal(official.metrics.find((item) => item.id === "secondaryRemaining").resetsAt, view.windows[1].resetsAt);
+assert.notEqual(expectedPrimaryReset, expectedSecondaryReset);
+assert.ok(!official.metrics.some((item) => item.id === "secondaryReset"));
+assert.equal(official.metrics.find((item) => item.id === "primaryReset").value, expectedPrimaryReset);
+assert.match(official.metrics.find((item) => item.id === "primaryReset").value, /^\d{2}-\d{2} \d{2}:\d{2}$/);
+assert.equal(official.metrics.find((item) => item.id === "todayTokens").value, "2万");
+assert.equal(official.metrics.find((item) => item.id === "last7DaysTokens").value, "3万");
+assert.equal(official.metrics.find((item) => item.id === "lifetimeTokens").value, "125万");
+assert.equal(official.nextRefreshAt - official.fetchedAt, 45000);
+const largeOfficial = toOfficialUsageSource({ ...view, todayTokens: 123456789, lifetimeTokens: 100000000 }, now.getTime());
+
+const proLimits = {
+  rateLimits: { limitId: "codex", planType: "pro", primary: rateLimits.rateLimits.secondary, secondary: null },
+  rateLimitsByLimitId: {
+    codex: { limitId: "codex", planType: "pro", primary: rateLimits.rateLimits.secondary, secondary: null },
+    codex_bengalfox: { limitId: "codex_bengalfox", planType: "pro", primary: rateLimits.rateLimits.primary, secondary: rateLimits.rateLimits.secondary },
+  },
+};
+const proView = normalizeUsageView(proLimits, tokenUsage, now);
+const rawProWindows = JSON.stringify(proView.windows);
+const proOfficial = toOfficialUsageSource(proView, now.getTime());
+assert.equal(proView.planType, "pro");
+assert.ok(proView.windows.some((item) => item.limitId === "codex_bengalfox"), "raw quota data stays unchanged for backend consumers");
+assert.equal(proOfficial.metrics.find((item) => item.id === "primaryRemaining").value, "--");
+assert.equal(proOfficial.metrics.find((item) => item.id === "primaryRemaining").resetsAt, null);
+assert.equal(proOfficial.metrics.find((item) => item.id === "secondaryRemaining").value, "42%");
+assert.equal(proOfficial.metrics.find((item) => item.id === "primaryReset").value, expectedSecondaryReset);
+assert.equal(JSON.stringify(proView.windows), rawProWindows);
+assert.equal(toOfficialUsageSource({ ...view, planType: " Pro " }).metrics.find((item) => item.id === "primaryRemaining").value, "--", "Pro keeps a placeholder even if a main 5h window exists");
+for (const planType of ["plus", "team", "enterprise", null]) {
+  assert.equal(toOfficialUsageSource({ ...view, planType }).metrics.find((item) => item.id === "primaryRemaining").value, "68%");
+}
+const sparkOnly = toOfficialUsageSource({ ...proView, windows: proView.windows.filter((item) => item.limitId !== "codex") });
+assert.equal(sparkOnly.metrics.find((item) => item.id === "secondaryRemaining").value, "--");
+assert.equal(sparkOnly.metrics.find((item) => item.id === "primaryReset").value, "--");
+assert.equal(normalizeUsageView(rateLimits, null, now, { account: { planType: "Pro" } }).planType, "pro");
+assert.equal(normalizeUsageView({ ...rateLimits, rateLimits: { ...rateLimits.rateLimits, planType: "plus" } }, null, now, { account: { planType: "pro" } }).planType, "plus");
+assert.equal(largeOfficial.metrics.find((item) => item.id === "todayTokens").value, "1.23亿");
+assert.equal(largeOfficial.metrics.find((item) => item.id === "lifetimeTokens").value, "1.00亿");
+
+const missingToday = normalizeUsageView(rateLimits, {
+  summary: { lifetimeTokens: 1250000 },
+  dailyUsageBuckets: [{ startDate: "2026-07-15", tokens: 169875 }],
+}, now);
+assert.equal(missingToday.todayTokens, null);
+assert.equal(missingToday.last7DaysTokens, null);
+assert.equal(missingToday.tokenUsageAvailable, true);
+assert.equal(missingToday.latestUsageDate, "2026-07-15");
+assert.match(missingToday.error, /最新数据截至 2026-07-15/);
+assert.equal(toOfficialUsageSource(missingToday, now.getTime()).metrics.find((item) => item.id === "todayTokens").value, "--");
+const explicitZeroToday = normalizeUsageView(rateLimits, {
+  summary: { lifetimeTokens: 1250000 },
+  dailyUsageBuckets: [{ startDate: "2026-07-22", tokens: 0 }],
+}, now);
+assert.equal(explicitZeroToday.todayTokens, 0);
+assert.equal(explicitZeroToday.last7DaysTokens, 0);
+assert.equal(toOfficialUsageSource(explicitZeroToday, now.getTime()).metrics.find((item) => item.id === "todayTokens").value, "0");
+
+const tokenEventLine = JSON.stringify({
+  timestamp: "2026-07-22T04:00:00.000Z",
+  type: "event_msg",
+  payload: {
+    type: "token_count",
+    info: {
+      total_token_usage: {
+        total_tokens: 150,
+        input_tokens: 120,
+        cached_input_tokens: 80,
+        output_tokens: 30,
+      },
+      last_token_usage: { total_tokens: 50 },
+    },
+  },
+});
+assert.equal(parseLocalTokenUsageEvent(tokenEventLine, "2026-07-22")?.tokens, 50);
+assert.equal(parseLocalTokenUsageEvent(tokenEventLine, "2026-07-22")?.totalTokens, 150);
+assert.equal(parseLocalTokenUsageEvent(tokenEventLine, "2026-07-22")?.totalInputTokens, 120);
+assert.equal(parseLocalTokenUsageEvent(tokenEventLine, "2026-07-22")?.totalCachedInputTokens, 80);
+assert.equal(parseLocalTokenUsageEvent(tokenEventLine, "2026-07-21"), null);
+assert.equal(parseLocalTokenUsageEvent('{"payload":{"type":"user_message","text":"token_count"}}'), null);
+const contextSampleLine = JSON.stringify({
+  timestamp: "2026-07-22T04:00:00.000Z", type: "event_msg", payload: { type: "token_count", info: {
+    last_token_usage: { input_tokens: 65000, output_tokens: 5000, reasoning_output_tokens: 4000, total_tokens: 70000 },
+    total_token_usage: { total_tokens: 1350000 }, model_context_window: 100000,
+  } },
+});
+assert.deepEqual(parseLocalContextWindowEvent(contextSampleLine).view, {
+  status: "ready", usedTokens: 70000, limitTokens: 100000, percent: 70,
+  sampledAt: "2026-07-22T04:00:00.000Z", inputTokens: 65000, outputTokens: 5000, estimated: true, reason: null,
+}, "context uses the last request, includes its output, and never double-counts reasoning output");
+for (const invalidLimit of [null, undefined, 0, -1, "100000", false]) {
+  const sample = JSON.parse(contextSampleLine);
+  sample.payload.info.model_context_window = invalidLimit;
+  const parsed = parseLocalContextWindowEvent(JSON.stringify(sample));
+  assert.equal(parsed.view.status, "unknown");
+  assert.equal(parsed.view.percent, null);
+}
+for (const invalidUsage of [null, undefined, -1, false]) {
+  const sample = JSON.parse(contextSampleLine);
+  sample.payload.info.last_token_usage.total_tokens = invalidUsage;
+  assert.equal(parseLocalContextWindowEvent(JSON.stringify(sample)).view.status, "unknown");
+}
+assert.equal(parseLocalContextWindowEvent(JSON.stringify({
+  timestamp: "2026-07-22T04:00:00.000Z", type: "event_msg", payload: { type: "token_count", info: null },
+})), null, "rate-limit-only notifications have no context sample");
+assert.deepEqual(parseLocalContextCompactionEvent(JSON.stringify({
+  timestamp: "2026-07-22T04:00:00.500Z",
+  type: "compacted",
+  payload: { window_number: 3, replacement_history: [] },
+})), {
+  timestamp: Date.parse("2026-07-22T04:00:00.500Z"),
+  windowNumber: 3,
+});
+assert.equal(parseLocalContextCompactionEvent('{"type":"event_msg","payload":{"type":"context_compacted"}}'), null);
+assert.deepEqual(parseLocalTokenContextEvent(JSON.stringify({
+  timestamp: "2026-07-22T04:00:00.000Z",
+  type: "turn_context",
+  payload: { turn_id: "019f8e6a-f751-7963-8474-551fcc730496" },
+})), {
+  kind: "turn",
+  timestamp: Date.parse("2026-07-22T04:00:00.000Z"),
+  turnId: "019f8e6a-f751-7963-8474-551fcc730496",
+});
+assert.deepEqual(parseLocalTokenContextEvent(JSON.stringify({
+  timestamp: "2026-07-22T04:00:01.000Z",
+  type: "event_msg",
+  payload: {
+    type: "thread_settings_applied",
+    thread_settings: { model_provider_id: "OpenAI" },
+  },
+})), {
+  kind: "settings",
+  timestamp: Date.parse("2026-07-22T04:00:01.000Z"),
+  modelProvider: "openai",
+});
+assert.deepEqual(parseLocalTokenContextEvent(JSON.stringify({
+  timestamp: "2026-07-22T04:00:02.000Z",
+  type: "session_meta",
+  payload: {
+    id: "019f8e6a-f751-7963-8474-551fcc730496",
+    parent_thread_id: "019f8e6a-f751-7963-8474-551fcc730400",
+    model_provider: "ChatGPT",
+  },
+})), {
+  kind: "session",
+  timestamp: Date.parse("2026-07-22T04:00:02.000Z"),
+  sessionId: "019f8e6a-f751-7963-8474-551fcc730496",
+  parentThreadId: "019f8e6a-f751-7963-8474-551fcc730400",
+  modelProvider: "chatgpt",
+  forked: true,
+});
+
+assert.equal(conversationTokenDelta(150, 100), 50);
+assert.equal(conversationTokenDelta(150, null), 150);
+assert.equal(conversationTokenDelta(0, null), 0);
+assert.equal(conversationTokenDelta(0, 0), 0);
+assert.equal(conversationTokenDelta(20, 50), 0);
+assert.equal(conversationTokenDelta(-1, 0), null);
+assert.equal(sessionTokenDelta(150, 100), 50);
+assert.equal(sessionTokenDelta(20, 50), 20);
+assert.equal(sessionTokenDelta(20, null), 20);
+assert.equal(sessionTokenDelta(-1, 0), null);
+
+function localDateString(value) {
+  const date = new Date(value);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function localNoonTimestamp() {
+  const date = new Date();
+  date.setHours(12, 0, 0, 0);
+  return date.getTime();
+}
+
+function uuidAt(timestamp, suffix = 1) {
+  const prefix = Math.trunc(timestamp).toString(16).padStart(12, "0").slice(-12);
+  const tail = `${Math.trunc(suffix).toString(16).padStart(20, "0")}`.slice(-20);
+  const compact = `${prefix}${tail}`;
+  return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
+}
+
+function sessionMeta(timestamp, id, provider, extra = {}) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "session_meta",
+    payload: { id, model_provider: provider, ...extra },
+  });
+}
+
+function turnContext(timestamp, turnId) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "turn_context",
+    payload: { turn_id: turnId },
+  });
+}
+
+function providerSettings(timestamp, provider) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "event_msg",
+    payload: {
+      type: "thread_settings_applied",
+      thread_settings: { model_provider_id: provider },
+    },
+  });
+}
+
+function tokenCount(timestamp, totalTokens, lastTokens = totalTokens) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: { total_tokens: totalTokens },
+        last_token_usage: { total_tokens: lastTokens },
+      },
+    },
+  });
+}
+
+function tokenCountWithCache(timestamp, totalTokens, lastTokens, inputTokens, cachedInputTokens, lastInputTokens, lastCachedInputTokens) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: {
+          total_tokens: totalTokens,
+          input_tokens: inputTokens,
+          cached_input_tokens: cachedInputTokens,
+        },
+        last_token_usage: {
+          total_tokens: lastTokens,
+          input_tokens: lastInputTokens,
+          cached_input_tokens: lastCachedInputTokens,
+        },
+      },
+    },
+  });
+}
+
+function taskComplete(timestamp, turnId, error = null, durationMs = undefined) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "event_msg",
+    payload: { type: "task_complete", turn_id: turnId, error, duration_ms: durationMs },
+  });
+}
+
+function taskStarted(timestamp, turnId) {
+  return JSON.stringify({ timestamp: new Date(timestamp).toISOString(), type: "event_msg", payload: { type: "task_started", turn_id: turnId } });
+}
+
+function turnAborted(timestamp, turnId) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "event_msg",
+    payload: { type: "turn_aborted", turn_id: turnId, reason: "interrupted" },
+  });
+}
+
+function contextCompacted(timestamp, windowNumber) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "compacted",
+    payload: { window_number: windowNumber, replacement_history: [] },
+  });
+}
+
+function quotaExceeded(timestamp, turnId) {
+  return JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(),
+    type: "event_msg",
+    payload: {
+      type: "task_complete",
+      turn_id: turnId,
+      error: {
+        message: "You've hit your usage limit. You can try again at Aug 31st, 2026 3:21 PM.",
+        codex_error_info: "usage_limit_exceeded",
+      },
+    },
+  });
+}
+
+const contextTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-context-test-"));
+try {
+  let clock = localNoonTimestamp();
+  const thread = uuidAt(clock - 100_000, 801);
+  const other = uuidAt(clock - 90_000, 802);
+  const sessionPath = path.join(contextTrackerRoot, `rollout-${thread}.jsonl`);
+  const sample = (timestamp, usedTokens, limitTokens = 100000, cumulative = 1350000, outputTokens = 5000) => JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(), type: "event_msg", payload: { type: "token_count", info: {
+      last_token_usage: { input_tokens: usedTokens - outputTokens, output_tokens: outputTokens, total_tokens: usedTokens },
+      total_token_usage: { total_tokens: cumulative }, model_context_window: limitTokens,
+    } },
+  });
+  writeFileSync(sessionPath, [sessionMeta(clock - 100_000, thread, "openai"), sample(clock - 1000, 70000), ""].join("\n"));
+  const updates = [];
+  const tracker = new LocalCodexTokenTracker({ sessionRoot: contextTrackerRoot, counterPath: null, now: () => clock, onUpdate: v => updates.push(v) });
+  tracker.setCurrentThreadId(thread);
+  let result = await tracker.refresh();
+  assert.equal(result.contextWindow.usedTokens, 70000);
+  assert.equal(result.contextWindow.percent, 70);
+  assert.equal(toSessionUsageSource(result, clock).metrics.find(m => m.id === "contextUsage").value, "≈70%");
+  const firstSampleAt = result.contextWindow.sampledAt;
+  appendFileSync(sessionPath, `${sample(clock, 70000)}\n`);
+  result = await tracker.refresh();
+  assert.equal(result.contextWindow.sampledAt, firstSampleAt, "replayed quota snapshots do not pretend to be a fresh request");
+  clock += 1000;
+  const beforeOutputUpdate = updates.length;
+  appendFileSync(sessionPath, `${sample(clock, 71000, 100000, 1350000, 6000)}\n`);
+  result = await tracker.refresh();
+  assert.equal(result.contextWindow.usedTokens, 71000, "new output is reflected even when the cumulative counter is unchanged");
+  assert.equal(result.contextWindow.percent, 71);
+  assert.ok(updates.length > beforeOutputUpdate, "context-only changes reach consumers");
+
+  tracker.setCurrentThreadId(other);
+  result = await tracker.refresh();
+  assert.equal(result.contextWindow.status, "unknown");
+  assert.equal(result.contextWindow.usedTokens, null, "switching to a thread without a sample cannot leak the previous value");
+  tracker.setCurrentThreadId(thread);
+  assert.equal((await tracker.refresh()).contextWindow.usedTokens, 71000);
+
+  clock += 1000;
+  appendFileSync(sessionPath, `${contextCompacted(clock, 1)}\n`);
+  result = await tracker.refresh();
+  assert.equal(result.contextWindow.status, "awaiting-sample");
+  assert.equal(result.contextWindow.usedTokens, null);
+  assert.equal(result.contextWindow.percent, null);
+  clock += 1000;
+  appendFileSync(sessionPath, `${sample(clock, 71000, 100000, 1350000, 6000)}\n`);
+  assert.equal((await tracker.refresh()).contextWindow.status, "awaiting-sample", "pre-compaction snapshot replay cannot restore an obsolete health signal");
+  clock += 1000;
+  appendFileSync(sessionPath, `${sample(clock, 25000, 200000, 1375000)}\n`);
+  result = await tracker.refresh();
+  assert.equal(result.contextWindow.status, "ready");
+  assert.equal(result.contextWindow.percent, 12.5);
+  assert.equal(result.contextWindow.limitTokens, 200000, "a new model capacity is taken from the same sample");
+  clock += 1000;
+  appendFileSync(sessionPath, `${sample(clock, 30000, null, 1405000)}\n`);
+  result = await tracker.refresh();
+  assert.equal(result.contextWindow.status, "unknown");
+  assert.equal(result.contextWindow.limitTokens, null, "missing capacity must not reuse the prior model's limit");
+  assert.equal(result.contextWindow.percent, null);
+  clock += 1000;
+  appendFileSync(sessionPath, `${sample(clock, 102000, 100000, 1507000)}\n`);
+  result = await tracker.refresh();
+  assert.equal(result.contextWindow.percent, 102, "over-capacity samples remain distinguishable from exactly full");
+
+  // Rotated files carry the logical thread in session_meta, not the filename UUID.
+  const rotatedPath = path.join(contextTrackerRoot, `rollout-${uuidAt(clock, 803)}.jsonl`);
+  clock += 1000;
+  writeFileSync(rotatedPath, [sessionMeta(clock, thread, "openai"), sample(clock, 80000, 200000, 1587000), ""].join("\n"));
+  assert.equal((await tracker.refresh()).contextWindow.percent, 40);
+  clock += 1000;
+  appendFileSync(rotatedPath, `${JSON.stringify({ timestamp: new Date(clock).toISOString(), type: "compacted", payload: {} })}\n`);
+  assert.equal((await tracker.refresh()).contextWindow.status, "awaiting-sample", "compaction without a window_number still invalidates occupancy");
+  clock += 1000;
+  appendFileSync(rotatedPath, `${sample(clock, 20000, 200000, 1607000)}\n`);
+  assert.equal((await tracker.refresh()).contextWindow.percent, 10);
+  clock += 1000;
+  appendFileSync(rotatedPath, `${JSON.stringify({ timestamp: new Date(clock).toISOString(), type: "event_msg", payload: { type: "context_compacted" } })}\n`);
+  assert.equal((await tracker.refresh()).contextWindow.status, "awaiting-sample", "legacy context-compacted events also invalidate occupancy");
+
+  const restarted = new LocalCodexTokenTracker({ sessionRoot: contextTrackerRoot, counterPath: null, now: () => clock });
+  restarted.setCurrentThreadId(thread);
+  assert.equal((await restarted.refresh()).contextWindow.status, "awaiting-sample", "a restart cannot resurrect old pre-compaction samples from another file");
+  tracker.setCurrentThreadId(null);
+  assert.equal((await tracker.refresh()).contextWindow.status, "unknown");
+} finally {
+  rmSync(contextTrackerRoot, { recursive: true, force: true });
+}
+
+const durationTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-duration-test-"));
+try {
+  let clock = localNoonTimestamp();
+  const thread = uuidAt(clock - 100_000, 401);
+  const other = uuidAt(clock - 90_000, 402);
+  const first = uuidAt(clock - 80_000, 403);
+  const second = uuidAt(clock - 20_000, 404);
+  const sessionPath = path.join(durationTrackerRoot, `rollout-${thread}.jsonl`);
+  writeFileSync(sessionPath, [
+    sessionMeta(clock - 100_000, thread, "openai"),
+    // Rehydrated timestamps are identical: the official duration is authoritative.
+    taskStarted(clock - 80_000, first), turnContext(clock - 80_000, first),
+    taskComplete(clock - 80_000, first, null, 53196),
+    taskComplete(clock - 79_000, first, null, 53196),
+    taskStarted(clock - 20_000, second), turnContext(clock - 20_000, second),
+    turnContext(clock - 5_000, second), "",
+  ].join("\n"));
+  writeFileSync(path.join(durationTrackerRoot, `rollout-${other}.jsonl`), [
+    sessionMeta(clock - 90_000, other, "openai"), taskComplete(clock - 10_000, uuidAt(clock - 30_000, 405), null, 999999), "",
+  ].join("\n"));
+  const tracker = new LocalCodexTokenTracker({ sessionRoot: durationTrackerRoot, counterPath: null, now: () => clock });
+  tracker.setCurrentThreadId(thread);
+  let result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 73196, "repeated contexts must not restart the current clock");
+  assert.equal(result.executionTimeEstimated, true);
+  assert.equal(result.executionTimeIncomplete, false);
+  assert.equal(result.executionTimeRunning, true);
+  assert.deepEqual(parseLocalTaskStartedEvent(taskStarted(clock, second)), { timestamp: clock, turnId: second });
+  assert.equal(parseLocalTaskCompleteEvent(taskComplete(clock, second, null, -1)).durationMs, null);
+  assert.equal(parseLocalTaskCompleteEvent(taskComplete(clock, second, null, "12")).durationMs, null);
+  clock += 5_000;
+  assert.equal((await tracker.refresh()).executionTimeMs, 78196);
+  appendFileSync(sessionPath, `${taskComplete(clock, second, null, 199388)}\n`);
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 252584, "completion replaces the estimate rather than adding it again");
+  assert.equal(result.executionTimeEstimated, false);
+  assert.equal(result.executionTimeRunning, false);
+  const idleThread = uuidAt(clock - 900_000, 420);
+  const idleTurn = uuidAt(clock - 700_000, 421);
+  const nextActiveTurn = uuidAt(clock - 500, 422);
+  const idlePath = path.join(durationTrackerRoot, `rollout-${idleThread}.jsonl`);
+  const messageActivity = (timestamp, role) => JSON.stringify({
+    timestamp: new Date(timestamp).toISOString(), type: "response_item", payload: { type: "message", role, content: [] },
+  });
+  writeFileSync(idlePath, [sessionMeta(clock - 900_000, idleThread, "openai"),
+    taskStarted(clock - 700_000, idleTurn), turnContext(clock - 700_000, idleTurn),
+    messageActivity(clock - 600_000, "assistant"),
+    messageActivity(clock - 1500, "system"), messageActivity(clock - 1200, "developer"), messageActivity(clock - 1000, "user"), "",
+  ].join("\n"));
+  tracker.setCurrentThreadId(idleThread);
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 100000, "late non-assistant messages cannot revive an orphan clock or count idle time");
+  assert.equal(result.executionTimeRunning, false);
+  appendFileSync(idlePath, [taskStarted(clock - 500, nextActiveTurn),
+    messageActivity(clock - 100, "assistant"), ""].join("\n"));
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 100500, "task_started alone assigns new activity to the new execution turn");
+  assert.equal(result.executionTimeRunning, true);
+  tracker.setCurrentThreadId(thread);
+  clock += 1_000_000;
+  assert.equal((await tracker.refresh()).executionTimeMs, 252584, "inter-turn idle time is excluded");
+  const paused = uuidAt(clock, 406);
+  appendFileSync(sessionPath, [taskStarted(clock - 10_000, paused), turnContext(clock - 10_000, paused), turnAborted(clock - 2_000, paused), ""].join("\n"));
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 260584);
+  assert.equal(result.executionTimeEstimated, true);
+  assert.equal(result.executionTimeRunning, false);
+  clock += 60_000;
+  assert.equal((await tracker.refresh()).executionTimeMs, 260584, "paused rounds do not keep counting");
+  const blocked = uuidAt(clock, 407);
+  appendFileSync(sessionPath, [taskStarted(clock - 10_000, blocked), turnContext(clock - 10_000, blocked), quotaExceeded(clock - 8_000, blocked), ""].join("\n"));
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 262584);
+  assert.equal(result.currentStatus, "quota-paused", "backend status remains available for auto-resume");
+  clock += 60_000;
+  assert.equal((await tracker.refresh()).executionTimeMs, 262584);
+  const orphan = uuidAt(clock - 600_000, 408);
+  appendFileSync(sessionPath, [taskStarted(clock - 600_000, orphan), turnContext(clock - 580_000, orphan), ""].join("\n"));
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 282584);
+  assert.equal(result.executionTimeRunning, false, "stale orphan starts cannot run for days");
+  assert.equal(result.executionTimeIncomplete, true);
+  const missing = uuidAt(clock, 409);
+  appendFileSync(sessionPath, `${taskComplete(clock, missing)}\n`);
+  assert.equal((await tracker.refresh()).executionTimeIncomplete, true);
+  const restarted = new LocalCodexTokenTracker({ sessionRoot: durationTrackerRoot, counterPath: null, now: () => clock });
+  restarted.setCurrentThreadId(thread);
+  assert.equal((await restarted.refresh()).executionTimeMs, 282584, "restart reconstructs the same total");
+  tracker.setCurrentThreadId(other);
+  assert.equal((await tracker.refresh()).executionTimeMs, 999999, "conversation clocks are independent");
+  const fork = uuidAt(clock + 1, 410);
+  const own = uuidAt(clock + 2, 411);
+  writeFileSync(path.join(durationTrackerRoot, `rollout-${fork}.jsonl`), [
+    sessionMeta(clock + 1, fork, "openai", { parent_thread_id: thread }),
+    taskStarted(clock - 80_000, first), turnContext(clock - 80_000, first), taskComplete(clock - 79_000, first, null, 53196),
+    taskStarted(clock + 2, own), turnContext(clock + 2, own), taskComplete(clock + 3, own, null, 1000), "",
+  ].join("\n"));
+  clock += 10;
+  tracker.setCurrentThreadId(fork);
+  assert.equal((await tracker.refresh()).executionTimeMs, 1000, "forks exclude inherited parent execution time");
+  const sparseFork = uuidAt(clock + 1, 413);
+  writeFileSync(path.join(durationTrackerRoot, `rollout-${sparseFork}.jsonl`), [
+    sessionMeta(clock + 1, sparseFork, "openai", { parent_thread_id: thread }),
+    taskComplete(clock + 2, first, null, 53196),
+    taskComplete(clock + 3, uuidAt(clock + 2, 414), null, 0), "",
+  ].join("\n"));
+  tracker.setCurrentThreadId(sparseFork);
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 0, "sparse own completion is counted but replayed parent completion is excluded");
+  assert.equal(result.executionTimeIncomplete, false, "official zero duration is valid");
+  tracker.setCurrentThreadId(uuidAt(clock, 412));
+  assert.equal((await tracker.refresh()).executionTimeMs, null, "missing sessions are not a fabricated zero");
+  const rotatedThread = uuidAt(clock - 2_000_000, 415);
+  const rotatedTurn = uuidAt(clock - 1_000_000, 416);
+  const oldPath = path.join(durationTrackerRoot, `rollout-${rotatedThread}.jsonl`);
+  const rotatedPath = path.join(durationTrackerRoot, `rollout-${rotatedThread}_${uuidAt(clock, 417)}.jsonl`);
+  writeFileSync(oldPath, [sessionMeta(clock - 2_000_000, rotatedThread, "openai"),
+    taskComplete(clock - 1_500_000, uuidAt(clock - 1_600_000, 418), null, 1000), ""].join("\n"));
+  writeFileSync(rotatedPath, [sessionMeta(clock - 2_000_000, rotatedThread, "openai"),
+    taskComplete(clock - 1_400_000, uuidAt(clock - 1_450_000, 419), null, 2000),
+    taskStarted(clock - 1_000_000, rotatedTurn), turnContext(clock - 1_000_000, rotatedTurn),
+    JSON.stringify({ timestamp: new Date(clock - 1000).toISOString(), type: "response_item", payload: { type: "function_call_output", output: "fixture" } }), ""].join("\n"));
+  const oldMtime = new Date(clock - 3 * 86400_000);
+  utimesSync(oldPath, oldMtime, oldMtime);
+  utimesSync(rotatedPath, oldMtime, oldMtime);
+  tracker.setCurrentThreadId(rotatedThread);
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 1003000, "rotated logs are grouped by their session header, not the runtime filename suffix");
+  assert.equal(result.executionTimeRunning, true, "recent tool activity keeps a long round live without fresh context/token events");
+  appendFileSync(rotatedPath, `${JSON.stringify({ timestamp: new Date(clock).toISOString(), type: "event_msg", payload: {
+    type: "turn_aborted", turn_id: rotatedTurn, duration_ms: 11014,
+  } })}\n`);
+  result = await tracker.refresh();
+  assert.equal(result.executionTimeMs, 14014, "official aborted duration replaces the estimate too");
+  assert.equal(result.executionTimeEstimated, false);
+  assert.equal(result.executionTimeRunning, false);
+} finally {
+  rmSync(durationTrackerRoot, { recursive: true, force: true });
+}
+
+const providerTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-provider-token-test-"));
+try {
+  const sessionRoot = path.join(providerTrackerRoot, "sessions");
+  const counterPath = path.join(providerTrackerRoot, "official-token-counter.json");
+  mkdirSync(sessionRoot, { recursive: true });
+  const trackerNow = localNoonTimestamp();
+  const trackerDateKey = localDateString(trackerNow);
+  const threadId = uuidAt(trackerNow - 60_000, 1);
+  const sessionPath = path.join(sessionRoot, `rollout-provider-${threadId}.jsonl`);
+  const at = (seconds) => trackerNow - 50_000 + seconds * 1000;
+  const zeroEvent = tokenCount(at(2), 0, 0);
+  writeFileSync(sessionPath, [
+    sessionMeta(at(0), threadId, "custom"),
+    turnContext(at(1), uuidAt(at(1), 11)),
+    providerSettings(at(1), "openai"),
+    zeroEvent,
+    zeroEvent,
+    turnContext(at(3), uuidAt(at(3), 12)),
+    providerSettings(at(3), "custom"),
+    tokenCount(at(4), 10, 10),
+    turnContext(at(5), uuidAt(at(5), 13)),
+    providerSettings(at(5), "openai"),
+    tokenCount(at(6), 30, 20),
+    contextCompacted(at(6.5), 1),
+    turnContext(at(7), uuidAt(at(7), 14)),
+    providerSettings(at(7), "custom"),
+    tokenCount(at(8), 50, 20),
+    turnContext(at(9), uuidAt(at(9), 15)),
+    providerSettings(at(9), "openai"),
+    tokenCount(at(10), 70, 20),
+    turnContext(at(11), uuidAt(at(11), 16)),
+    tokenCount(at(12), 20, 20),
+    tokenCount(at(14), 27, 7),
+    tokenCount(at(15), 33, 6),
+    contextCompacted(at(15.5), 2),
+    tokenCount(at(16), 33, 99),
+    taskComplete(at(16.5), uuidAt(at(11), 16)),
+    "",
+  ].join("\n"), "utf8");
+  writeFileSync(counterPath, `${JSON.stringify({
+    schemaVersion: 5,
+    dailyDate: trackerDateKey,
+    todayTokens: 999999,
+    seenEvents: ["legacy:event"],
+  })}\n`, "utf8");
+
+  const tracker = new LocalCodexTokenTracker({
+    sessionRoot,
+    counterPath,
+    now: () => trackerNow,
+  });
+  tracker.setCurrentThreadId(threadId);
+  assert.equal((await tracker.refresh()).todayTokens, 0);
+  tracker.setOfficialModelProviders(["openai"]);
+  const firstView = await tracker.refresh();
+  assert.equal(firstView.todayTokens, 73);
+  assert.equal(firstView.currentTaskTokens, 103);
+  assert.equal(firstView.lastTurnTokens, 33);
+  assert.equal(firstView.currentStatus, "completed");
+  assert.equal(firstView.contextCompactions, 2);
+  const blockedTurnId = uuidAt(at(17), 17);
+  appendFileSync(sessionPath, `${quotaExceeded(at(17), blockedTurnId)}\n`, "utf8");
+  const blockedView = await tracker.refresh();
+  assert.equal(blockedView.quotaExceeded.turnId, blockedTurnId);
+  assert.equal(blockedView.quotaExceeded.observedLive, true);
+  assert.match(blockedView.quotaExceeded.eventId, /^[0-9a-f]{32}$/);
+  assert.equal(blockedView.currentStatus, "quota-paused");
+  appendFileSync(sessionPath, `${turnContext(at(18), uuidAt(at(18), 18))}\n`, "utf8");
+  const resumedView = await tracker.refresh();
+  assert.equal(resumedView.quotaExceeded, null);
+  assert.equal(resumedView.currentStatus, "running");
+  appendFileSync(sessionPath, `${tokenCount(at(19), 40, 7)}\n`, "utf8");
+  const activeTurnView = await tracker.refresh();
+  assert.equal(activeTurnView.currentTaskTokens, 110);
+  assert.equal(activeTurnView.lastTurnTokens, 33);
+  assert.equal(activeTurnView.currentStatus, "running");
+  appendFileSync(sessionPath, `${turnAborted(at(20), uuidAt(at(18), 18))}\n`, "utf8");
+  const pausedView = await tracker.refresh();
+  assert.equal(pausedView.currentStatus, "paused");
+  const persisted = JSON.parse(readFileSync(counterPath, "utf8"));
+  assert.equal(persisted.schemaVersion, 8);
+  assert.equal(persisted.mode, "official-conversation-raw");
+  assert.equal(persisted.todayTokens, 80);
+  assert.ok(!persisted.seenEvents.includes("legacy:event"));
+  assert.equal(persisted.seenEvents.filter((identity) => identity.endsWith(":total:0")).length, 1);
+
+  const restartedTracker = new LocalCodexTokenTracker({
+    sessionRoot,
+    counterPath,
+    officialModelProviders: ["openai"],
+    now: () => trackerNow + 1,
+  });
+  restartedTracker.setCurrentThreadId(threadId);
+  const restartedView = await restartedTracker.refresh();
+  assert.equal(restartedView.todayTokens, 80);
+  assert.equal(restartedView.currentTaskTokens, 110);
+  assert.equal(restartedView.lastTurnTokens, 33);
+  assert.equal(restartedView.currentStatus, "paused");
+  assert.equal(restartedView.contextCompactions, 2);
+  assert.equal(JSON.parse(readFileSync(counterPath, "utf8")).todayTokens, 80);
+} finally {
+  rmSync(providerTrackerRoot, { recursive: true, force: true });
+}
+
+const quotaTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-quota-event-test-"));
+try {
+  const sessionRoot = path.join(quotaTrackerRoot, "sessions");
+  mkdirSync(sessionRoot, { recursive: true });
+  const trackerNow = localNoonTimestamp();
+  const liveThreadId = uuidAt(trackerNow - 2_000, 20);
+  const liveTurnId = uuidAt(trackerNow - 1_500, 21);
+  writeFileSync(path.join(sessionRoot, `rollout-live-${liveThreadId}.jsonl`), [
+    sessionMeta(trackerNow - 2_000, liveThreadId, "openai"),
+    turnContext(trackerNow - 1_500, liveTurnId),
+    quotaExceeded(trackerNow - 1_000, liveTurnId),
+    "",
+  ].join("\n"), "utf8");
+  const liveTracker = new LocalCodexTokenTracker({ sessionRoot, counterPath: path.join(quotaTrackerRoot, "live-counter.json"), now: () => trackerNow });
+  liveTracker.setCurrentThreadId(liveThreadId);
+  assert.equal((await liveTracker.refresh()).quotaExceeded.observedLive, true);
+
+  const historicalThreadId = uuidAt(trackerNow - 180_000, 22);
+  const historicalTurnId = uuidAt(trackerNow - 179_000, 23);
+  writeFileSync(path.join(sessionRoot, `rollout-historical-${historicalThreadId}.jsonl`), [
+    sessionMeta(trackerNow - 180_000, historicalThreadId, "openai"),
+    turnContext(trackerNow - 179_000, historicalTurnId),
+    quotaExceeded(trackerNow - 120_000, historicalTurnId),
+    "",
+  ].join("\n"), "utf8");
+  const historicalTracker = new LocalCodexTokenTracker({ sessionRoot, counterPath: path.join(quotaTrackerRoot, "historical-counter.json"), now: () => trackerNow });
+  historicalTracker.setCurrentThreadId(historicalThreadId);
+  assert.equal((await historicalTracker.refresh()).quotaExceeded.observedLive, false);
+} finally {
+  rmSync(quotaTrackerRoot, { recursive: true, force: true });
+}
+
+const backgroundTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-background-resume-test-"));
+try {
+  const sessionRoot = path.join(backgroundTrackerRoot, "sessions");
+  mkdirSync(sessionRoot, { recursive: true });
+  const trackerNow = localNoonTimestamp();
+  const oldTimestamp = trackerNow - 3 * 86400000;
+  const currentId = uuidAt(trackerNow - 9000, 81);
+  const backgroundId = uuidAt(oldTimestamp, 82);
+  const apiId = uuidAt(trackerNow - 8000, 83);
+  const unknownId = uuidAt(trackerNow - 7000, 84);
+  const missingId = uuidAt(trackerNow - 6000, 85);
+  const backgroundTurn = uuidAt(oldTimestamp + 1000, 86);
+  const apiTurn = uuidAt(trackerNow - 7500, 87);
+  const backgroundPath = path.join(sessionRoot, `rollout-background-${backgroundId}.jsonl`);
+  writeFileSync(path.join(sessionRoot, `rollout-current-${currentId}.jsonl`), [
+    sessionMeta(trackerNow - 9000, currentId, "openai"),
+    turnContext(trackerNow - 8500, uuidAt(trackerNow - 8500, 88)),
+    tokenCount(trackerNow - 8000, 10),
+    "",
+  ].join("\n"));
+  writeFileSync(backgroundPath, [
+    sessionMeta(oldTimestamp, backgroundId, "openai"),
+    turnContext(oldTimestamp + 1000, backgroundTurn),
+    tokenCount(oldTimestamp + 2000, 7),
+    quotaExceeded(oldTimestamp + 3000, backgroundTurn),
+    "",
+  ].join("\n"));
+  utimesSync(backgroundPath, new Date(oldTimestamp + 3000), new Date(oldTimestamp + 3000));
+  writeFileSync(path.join(sessionRoot, `rollout-api-${apiId}.jsonl`), [
+    sessionMeta(trackerNow - 8000, apiId, "custom"),
+    turnContext(trackerNow - 7500, apiTurn),
+    quotaExceeded(trackerNow - 7000, apiTurn),
+    "",
+  ].join("\n"));
+  writeFileSync(path.join(sessionRoot, `rollout-unknown-${unknownId}.jsonl`), [
+    sessionMeta(trackerNow - 7000, unknownId, "openai"),
+    tokenCount(trackerNow - 6500, 3),
+    "",
+  ].join("\n"));
+  const updates = [];
+  const tracker = new LocalCodexTokenTracker({
+    sessionRoot,
+    counterPath: path.join(backgroundTrackerRoot, "counter.json"),
+    now: () => trackerNow,
+    onUpdate: (view) => updates.push(view),
+  });
+  tracker.setCurrentThreadId(currentId);
+  await tracker.refresh();
+  assert.equal(tracker.threadLatest.has(backgroundId), false, "untracked old files are not scanned");
+  const enabledIds = [backgroundId, apiId, unknownId, missingId];
+  assert.equal(tracker.setAutoResumeThreadIds([...enabledIds, backgroundId.toUpperCase(), "invalid"]), true);
+  const unclassified = await tracker.refresh();
+  assert.equal(unclassified.autoResumeTasks[backgroundId].quotaExceeded, null);
+  assert.equal(unclassified.autoResumeTasks[backgroundId].currentStatus, null);
+  assert.equal(tracker.setAutoResumeThreadIds([...enabledIds].reverse()), false);
+  tracker.setOfficialModelProviders(["openai"]);
+  const tracked = await tracker.refresh();
+  assert.equal(tracked.currentThreadId, currentId);
+  assert.equal(tracked.currentStatus, "running");
+  assert.equal(tracked.autoResumeTasks[backgroundId].quotaExceeded.observedLive, false);
+  assert.equal(tracked.autoResumeTasks[backgroundId].currentStatus, "quota-paused");
+  assert.equal(tracked.autoResumeTasks[backgroundId].timestamp, oldTimestamp + 3000);
+  assert.equal(tracked.autoResumeTasks[backgroundId].turnId, backgroundTurn);
+  assert.equal(tracked.autoResumeTasks[apiId].quotaExceeded, null, "API billing errors cannot arm subscription resume");
+  assert.equal(tracked.autoResumeTasks[apiId].currentStatus, null);
+  assert.equal(tracked.autoResumeTasks[unknownId].currentStatus, null, "token counts do not invent task status");
+  assert.equal(tracked.autoResumeTasks[missingId], undefined);
+  assert.equal(tracked.todayTokens, 13, "old background history does not count towards today");
+  const emitted = updates.length;
+  const discovery = tracker.sessionDiscovery;
+  await tracker.refresh();
+  assert.equal(tracker.sessionDiscovery, discovery, "unchanged directories reuse the discovered file list");
+  assert.equal(updates.length, emitted, "unchanged background snapshots do not emit repeatedly");
+  assert.deepEqual(mergeOfficialLocalUsage({}, tracked, new Date(trackerNow)).autoResumeTasks, tracked.autoResumeTasks);
+
+  appendFileSync(backgroundPath, `${turnAborted(trackerNow - 5000, backgroundTurn)}\n`);
+  const cancelled = await tracker.refresh();
+  assert.equal(cancelled.autoResumeTasks[backgroundId].currentStatus, "paused");
+  assert.equal(cancelled.autoResumeTasks[backgroundId].quotaExceeded, null);
+  assert.equal(updates.length, emitted + 1, "background cancellation emits without changes in the visible task");
+  writeFileSync(path.join(sessionRoot, `zz-duplicate-history-${backgroundId}.jsonl`), [
+    sessionMeta(oldTimestamp, backgroundId, "openai"),
+    turnContext(oldTimestamp + 1000, backgroundTurn),
+    tokenCount(oldTimestamp + 2000, 7),
+    quotaExceeded(oldTimestamp + 3000, backgroundTurn),
+    "",
+  ].join("\n"));
+  assert.equal((await tracker.refresh()).autoResumeTasks[backgroundId].currentStatus, "paused",
+    "rediscovered older quota history cannot resurrect a cancelled task");
+  assert.notEqual(tracker.sessionDiscovery, discovery, "new files refresh the directory inventory immediately");
+  const nextTurn = uuidAt(trackerNow - 4000, 89);
+  appendFileSync(backgroundPath, `${turnContext(trackerNow - 4000, nextTurn)}\n`);
+  assert.equal((await tracker.refresh()).autoResumeTasks[backgroundId].currentStatus, "running");
+  appendFileSync(backgroundPath, `${tokenCount(trackerNow - 3000, 12, 5)}\n${taskComplete(trackerNow - 2000, nextTurn)}\n`);
+  const completed = await tracker.refresh();
+  assert.equal(completed.autoResumeTasks[backgroundId].currentStatus, "completed");
+  assert.equal(completed.autoResumeTasks[backgroundId].quotaExceeded, null);
+  assert.equal(completed.todayTokens, 18);
+  tracker.setCurrentThreadId(backgroundId);
+  assert.equal((await tracker.refresh()).todayTokens, 18, "visible and background tracking do not count the same file twice");
+  tracker.setAutoResumeThreadIds([]);
+  const disabled = await tracker.refresh();
+  assert.deepEqual(disabled.autoResumeTasks, {});
+  assert.equal(disabled.todayTokens, 18);
+
+  const delegateCalls = [];
+  const fakeCombined = { localOfficial: { setAutoResumeThreadIds: (ids) => { delegateCalls.push(ids); return true; } } };
+  assert.equal(CombinedUsageClient.prototype.setAutoResumeThreadIds.call(fakeCombined, enabledIds), true);
+  assert.deepEqual(delegateCalls, [enabledIds]);
+} finally {
+  rmSync(backgroundTrackerRoot, { recursive: true, force: true });
+}
+
+const cacheTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-cache-hit-test-"));
+try {
+  const sessionRoot = path.join(cacheTrackerRoot, "sessions");
+  mkdirSync(sessionRoot, { recursive: true });
+  const trackerNow = localNoonTimestamp();
+  const threadId = uuidAt(trackerNow - 10_000, 24);
+  const turnId = uuidAt(trackerNow - 9_000, 25);
+  const sessionPath = path.join(sessionRoot, `rollout-cache-${threadId}.jsonl`);
+  writeFileSync(sessionPath, [
+    sessionMeta(trackerNow - 10_000, threadId, "openai"),
+    turnContext(trackerNow - 9_000, turnId),
+    tokenCountWithCache(trackerNow - 8_000, 100, 100, 80, 40, 80, 40),
+    tokenCountWithCache(trackerNow - 7_000, 150, 50, 120, 70, 40, 30),
+    tokenCountWithCache(trackerNow - 6_000, 140, 20, 112, 62, 16, 8),
+    tokenCountWithCache(trackerNow - 5_000, 160, 20, 128, 70, 16, 8),
+    "",
+  ].join("\n"), "utf8");
+  const tracker = new LocalCodexTokenTracker({ sessionRoot, counterPath: path.join(cacheTrackerRoot, "counter.json"), now: () => trackerNow });
+  tracker.setCurrentThreadId(threadId);
+  const cacheView = await tracker.refresh();
+  assert.equal(cacheView.currentTaskTokens, 190);
+  assert.ok(Math.abs(cacheView.cacheHitRate - ((86 / 152) * 100)) < 1e-9);
+  assert.equal(toSessionUsageSource(cacheView, trackerNow).metrics.find((item) => item.id === "cacheHitRate").value, "56.6%");
+  assert.equal(cacheView.lastTurnCacheHitRate, null, "unfinished answer has no completed cache rate");
+  appendFileSync(sessionPath, `${taskComplete(trackerNow - 4_000, turnId)}\n`);
+  const completedCache = await tracker.refresh();
+  assert.ok(Math.abs(completedCache.lastTurnCacheHitRate - 86 / 152 * 100) < 1e-9);
+  assert.equal(toSessionUsageSource(completedCache, trackerNow).metrics.find(item => item.id === "lastTurnCacheHitRate").value, "56.6%");
+  const nextCacheTurn = uuidAt(trackerNow - 3_000, 26);
+  appendFileSync(sessionPath, `${turnContext(trackerNow - 3_000, nextCacheTurn)}\n${tokenCountWithCache(trackerNow - 2_000, 200, 40, 160, 102, 32, 32)}\n`);
+  assert.equal((await tracker.refresh()).lastTurnCacheHitRate, completedCache.lastTurnCacheHitRate,
+    "in-progress answer preserves previous completed cache rate");
+  appendFileSync(sessionPath, `${tokenCountWithCache(trackerNow - 1_900, 200, 40, 160, 102, 32, 32)}\n${taskComplete(trackerNow - 1_000, nextCacheTurn)}\n`);
+  assert.equal((await tracker.refresh()).lastTurnCacheHitRate, 100, "duplicate snapshot is ignored");
+  const restoredCacheTracker = new LocalCodexTokenTracker({ sessionRoot, counterPath: null, now: () => trackerNow });
+  restoredCacheTracker.setCurrentThreadId(threadId);
+  assert.equal((await restoredCacheTracker.refresh()).lastTurnCacheHitRate, 100, "completed cache rate restores from log");
+  const rotatedTurn = uuidAt(trackerNow - 800, 27);
+  const runtimeId = uuidAt(trackerNow - 700, 28);
+  writeFileSync(path.join(sessionRoot, `rollout-cache-${threadId}_${runtimeId}.jsonl`), [
+    sessionMeta(trackerNow - 10_000, threadId, "openai"),
+    turnContext(trackerNow - 800, rotatedTurn),
+    tokenCountWithCache(trackerNow - 600, 240, 40, 192, 110, 32, 8),
+    taskComplete(trackerNow - 500, rotatedTurn), "",
+  ].join("\n"));
+  assert.equal((await restoredCacheTracker.refresh()).lastTurnCacheHitRate, 25,
+    "newest completed answer uses logical task ID across rotated runtime logs");
+  const merged = await restoredCacheTracker.refresh();
+  assert.equal(merged.currentTaskTokens, 270);
+  assert.equal(merged.lastTurnTokens, 40);
+  assert.ok(Math.abs(merged.cacheHitRate - 126 / 216 * 100) < 1e-9);
+  const overlapPath = path.join(sessionRoot, `rollout-overlap-${threadId}_${uuidAt(trackerNow, 29)}.jsonl`);
+  const directoryTimes = statSync(sessionRoot);
+  writeFileSync(overlapPath, readFileSync(sessionPath, "utf8"));
+  utimesSync(sessionRoot, directoryTimes.atime, directoryTimes.mtime);
+  assert.equal((await restoredCacheTracker.refresh()).currentTaskTokens, 270,
+    "replayed history in a second runtime file does not duplicate task totals");
+  const splitTurn = uuidAt(trackerNow, 30);
+  const splitEvent = tokenCountWithCache(trackerNow + 200, 280, 40, 224, 134, 32, 24);
+  appendFileSync(overlapPath, `${turnContext(trackerNow + 100, splitTurn)}\n${splitEvent}\n`);
+  const activeMerged = await restoredCacheTracker.refresh();
+  assert.equal(activeMerged.currentTaskTokens, 310);
+  assert.equal(activeMerged.lastTurnTokens, 40, "active split turn preserves last completed answer");
+  writeFileSync(path.join(sessionRoot, `rollout-split-${threadId}_${uuidAt(trackerNow + 1000, 31)}.jsonl`), [
+    sessionMeta(trackerNow - 10_000, threadId, "openai"), turnContext(trackerNow + 100, splitTurn), splitEvent,
+    tokenCountWithCache(trackerNow + 300, 300, 20, 240, 142, 16, 8), taskComplete(trackerNow + 400, splitTurn), "",
+  ].join("\n"));
+  const splitMerged = await restoredCacheTracker.refresh();
+  assert.equal(splitMerged.currentTaskTokens, 330);
+  assert.equal(splitMerged.lastTurnTokens, 60, "one answer split across files sums only distinct requests");
+  assert.ok(Math.abs(splitMerged.lastTurnCacheHitRate - 32 / 48 * 100) < 1e-9);
+  const restartedMerged = new LocalCodexTokenTracker({ sessionRoot, counterPath: null, now: () => trackerNow });
+  restartedMerged.setCurrentThreadId(threadId);
+  assert.equal((await restartedMerged.refresh()).currentTaskTokens, 330);
+  const completionOnlyTurn = uuidAt(trackerNow + 2000, 32);
+  appendFileSync(overlapPath, `${turnContext(trackerNow + 2000, completionOnlyTurn)}\n${tokenCountWithCache(trackerNow + 2100, 340, 40, 272, 158, 32, 16)}\n`);
+  assert.equal((await restartedMerged.refresh()).lastTurnTokens, 60);
+  writeFileSync(path.join(sessionRoot, `rollout-complete-only-${threadId}_${uuidAt(trackerNow + 3000, 33)}.jsonl`), [
+    sessionMeta(trackerNow - 10_000, threadId, "openai"), taskComplete(trackerNow + 2200, completionOnlyTurn), "",
+  ].join("\n"));
+  const completionOnly = await restartedMerged.refresh();
+  assert.equal(completionOnly.currentTaskTokens, 370);
+  assert.equal(completionOnly.lastTurnTokens, 40, "explicit completion can be in a new file without turn_context");
+  assert.equal(completionOnly.lastTurnCacheHitRate, 50);
+} finally {
+  rmSync(cacheTrackerRoot, { recursive: true, force: true });
+}
+
+const lifetimeTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-official-lifetime-test-"));
+try {
+  const sessionRoot = path.join(lifetimeTrackerRoot, "sessions");
+  const counterPath = path.join(lifetimeTrackerRoot, "official-token-counter.json");
+  mkdirSync(sessionRoot, { recursive: true });
+  let trackerNow = localNoonTimestamp();
+  const threadId = uuidAt(trackerNow - 10_000, 18);
+  const sessionPath = path.join(sessionRoot, `rollout-lifetime-${threadId}.jsonl`);
+  writeFileSync(sessionPath, [
+    sessionMeta(trackerNow - 3000, threadId, "openai"),
+    turnContext(trackerNow - 2000, uuidAt(trackerNow - 2000, 19)),
+    tokenCount(trackerNow - 1000, 100, 100),
+    "",
+  ].join("\n"), "utf8");
+
+  const tracker = new LocalCodexTokenTracker({
+    sessionRoot,
+    counterPath,
+    officialModelProviders: ["openai"],
+    now: () => trackerNow,
+  });
+  tracker.setCurrentThreadId(threadId);
+  assert.equal((await tracker.refresh()).lifetimeTokens, null);
+  assert.equal(tracker.view.last7DaysTokens, null);
+  assert.equal(tracker.setOfficialLifetimeTokens(1000, trackerNow), true);
+  assert.equal(tracker.setOfficialLast7DaysTokens(700, trackerNow), true);
+  assert.equal(tracker.view.lifetimeTokens, 1000);
+  assert.equal(tracker.view.last7DaysTokens, 700);
+
+  appendFileSync(sessionPath, [
+    turnContext(trackerNow + 1000, uuidAt(trackerNow + 1000, 20)),
+    tokenCount(trackerNow + 2000, 130, 30),
+    "",
+  ].join("\n"), "utf8");
+  trackerNow += 2500;
+  assert.equal((await tracker.refresh()).lifetimeTokens, 1030);
+  assert.equal(tracker.view.last7DaysTokens, 730);
+  assert.equal(tracker.setOfficialLifetimeTokens(1000, trackerNow), false);
+  assert.equal(tracker.setOfficialLast7DaysTokens(700, trackerNow), false);
+  assert.equal(tracker.view.lifetimeTokens, 1030);
+  assert.equal(tracker.view.last7DaysTokens, 730);
+
+  trackerNow += 500;
+  assert.equal(tracker.setOfficialLifetimeTokens(1015, trackerNow), true);
+  assert.equal(tracker.setOfficialLast7DaysTokens(715, trackerNow), true);
+  assert.equal(tracker.view.lifetimeTokens, 1015);
+  assert.equal(tracker.view.last7DaysTokens, 715);
+  appendFileSync(sessionPath, [
+    turnContext(trackerNow + 1000, uuidAt(trackerNow + 1000, 21)),
+    tokenCount(trackerNow + 2000, 140, 10),
+    "",
+  ].join("\n"), "utf8");
+  trackerNow += 2500;
+  assert.equal((await tracker.refresh()).lifetimeTokens, 1025);
+  assert.equal(tracker.view.last7DaysTokens, 725);
+
+  const restartedTracker = new LocalCodexTokenTracker({
+    sessionRoot,
+    counterPath,
+    officialModelProviders: ["openai"],
+    now: () => trackerNow + 1000,
+  });
+  restartedTracker.setCurrentThreadId(threadId);
+  assert.equal((await restartedTracker.refresh()).lifetimeTokens, 1025);
+  assert.equal(restartedTracker.view.last7DaysTokens, 725);
+  assert.equal(restartedTracker.setOfficialLifetimeTokens(1020, trackerNow + 1000), true);
+  assert.equal(restartedTracker.setOfficialLast7DaysTokens(720, trackerNow + 1000), true);
+  assert.equal((await restartedTracker.refresh()).lifetimeTokens, 1020);
+  assert.equal(restartedTracker.view.last7DaysTokens, 720);
+  const persisted = JSON.parse(readFileSync(counterPath, "utf8"));
+  assert.equal(persisted.schemaVersion, 8);
+  assert.equal(persisted.officialLifetime.baseTokens, 1020);
+  assert.equal(persisted.officialLifetime.pendingTokens, 0);
+  assert.equal(persisted.officialLast7Days.baseTokens, 720);
+  assert.equal(persisted.officialLast7Days.pendingTokens, 0);
+} finally {
+  rmSync(lifetimeTrackerRoot, { recursive: true, force: true });
+}
+
+const forkTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-fork-token-test-"));
+try {
+  const sessionRoot = path.join(forkTrackerRoot, "sessions");
+  const counterPath = path.join(forkTrackerRoot, "official-token-counter.json");
+  mkdirSync(sessionRoot, { recursive: true });
+  const trackerNow = localNoonTimestamp();
+  const parentId = uuidAt(trackerNow - 90_000, 21);
+  const childCreatedAt = trackerNow - 40_000;
+  const childId = uuidAt(childCreatedAt, 22);
+  const replayedTurnId = uuidAt(childCreatedAt - 10_000, 23);
+  const childTurnId = uuidAt(childCreatedAt + 10_000, 24);
+  const childPath = path.join(sessionRoot, `a-rollout-child-${childId}.jsonl`);
+  const parentPath = path.join(sessionRoot, `b-rollout-parent-${parentId}.jsonl`);
+  writeFileSync(parentPath, [
+    sessionMeta(trackerNow - 80_000, parentId, "openai"),
+    turnContext(trackerNow - 70_000, replayedTurnId),
+    tokenCount(trackerNow - 60_000, 100, 100),
+    "",
+  ].join("\n"), "utf8");
+  writeFileSync(childPath, [
+    sessionMeta(childCreatedAt, childId, "openai", {
+      parent_thread_id: parentId,
+      source: { subagent: { role: "worker" } },
+    }),
+    turnContext(childCreatedAt + 1000, replayedTurnId),
+    tokenCount(childCreatedAt + 2000, 100, 100),
+    turnContext(childCreatedAt + 10_000, childTurnId),
+    tokenCount(childCreatedAt + 20_000, 130, 30),
+    "",
+  ].join("\n"), "utf8");
+
+  const tracker = new LocalCodexTokenTracker({
+    sessionRoot,
+    counterPath,
+    officialModelProviders: ["openai"],
+    now: () => trackerNow,
+  });
+  tracker.setCurrentThreadId(parentId);
+  const forkView = await tracker.refresh();
+  assert.equal(forkView.todayTokens, 130);
+  const persisted = JSON.parse(readFileSync(counterPath, "utf8"));
+  assert.equal(persisted.seenEvents.filter((identity) => identity === `${replayedTurnId}:epoch:0:total:100`).length, 1);
+  assert.ok(persisted.seenEvents.includes(`${childTurnId}:epoch:0:total:130`));
+} finally {
+  rmSync(forkTrackerRoot, { recursive: true, force: true });
+}
+
+const midnightTrackerRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-midnight-token-test-"));
+try {
+  const sessionRoot = path.join(midnightTrackerRoot, "sessions");
+  const counterPath = path.join(midnightTrackerRoot, "official-token-counter.json");
+  mkdirSync(sessionRoot, { recursive: true });
+  const dayOne = new Date();
+  dayOne.setHours(23, 59, 30, 0);
+  let trackerNow = dayOne.getTime();
+  const dayTwo = new Date(dayOne);
+  dayTwo.setDate(dayTwo.getDate() + 1);
+  dayTwo.setHours(0, 1, 0, 0);
+  const threadId = uuidAt(trackerNow - 60_000, 31);
+  const sessionPath = path.join(sessionRoot, `rollout-midnight-${threadId}.jsonl`);
+  writeFileSync(sessionPath, [
+    sessionMeta(trackerNow - 50_000, threadId, "openai"),
+    turnContext(trackerNow - 40_000, uuidAt(trackerNow - 40_000, 32)),
+    tokenCount(trackerNow - 30_000, 200, 200),
+    "",
+  ].join("\n"), "utf8");
+  const tracker = new LocalCodexTokenTracker({
+    sessionRoot,
+    counterPath,
+    officialModelProviders: ["openai"],
+    now: () => trackerNow,
+  });
+  tracker.setCurrentThreadId(threadId);
+  assert.equal((await tracker.refresh()).todayTokens, 200);
+
+  trackerNow = dayTwo.getTime();
+  appendFileSync(sessionPath, [
+    turnContext(trackerNow - 20_000, uuidAt(trackerNow - 20_000, 33)),
+    tokenCount(trackerNow - 10_000, 260, 60),
+    "",
+  ].join("\n"), "utf8");
+  const dayTwoView = await tracker.refresh();
+  assert.equal(dayTwoView.dailyDate, localDateString(trackerNow));
+  assert.equal(dayTwoView.todayTokens, 60);
+  assert.equal(JSON.parse(readFileSync(counterPath, "utf8")).todayTokens, 60);
+} finally {
+  rmSync(midnightTrackerRoot, { recursive: true, force: true });
+}
+
+const trackerDate = new Date();
+const trackerDateKey = localDateString(trackerDate);
+const mergeThreadId = "019f8e6a-f751-7963-8474-551fcc730496";
+const delayedOfficial = mergeOfficialLocalUsage(missingToday, {
+  status: "ready",
+  dailyDate: trackerDateKey,
+  todayTokens: 90,
+  last7DaysTokens: 910000,
+  lifetimeTokens: 1300000,
+  currentThreadId: mergeThreadId,
+  currentTaskTokens: 190,
+  lastTurnTokens: 40,
+  currentStatus: "completed",
+  executionTimeMs: 691323,
+  executionTimeEstimated: false,
+  executionTimeIncomplete: false,
+  executionTimeRunning: false,
+  executionTimeUpdatedAt: trackerDate.toISOString(),
+  cacheHitRate: 75.25,
+  contextCompactions: 3,
+}, trackerDate);
+assert.equal(delayedOfficial.todayTokens, 90);
+assert.equal(delayedOfficial.last7DaysTokens, 910000);
+assert.equal(delayedOfficial.lifetimeTokens, 1300000);
+assert.equal(delayedOfficial.todayTokenScope, "local-official-conversations");
+const delayedSource = toOfficialUsageSource(delayedOfficial, trackerDate.getTime());
+assert.equal(delayedSource.metrics.find((item) => item.id === "todayTokens").value, "90");
+assert.ok(!delayedSource.metrics.some((item) => ["currentTaskTokens", "lastTurnTokens", "contextCompactions"].includes(item.id)));
+const delayedSessionSource = toSessionUsageSource(delayedOfficial, trackerDate.getTime());
+const mergedContext = mergeOfficialLocalUsage({}, {
+  currentThreadId: mergeThreadId,
+  contextWindow: { ...parseLocalContextWindowEvent(contextSampleLine).view, percent: 0 },
+}, trackerDate);
+assert.equal(mergedContext.contextWindow.percent, 70, "the outward ratio is derived from validated token counts");
+assert.equal(mergeOfficialLocalUsage({}, {
+  contextWindow: { status: "ready", usedTokens: null, limitTokens: 100000, sampledAt: trackerDate.toISOString() },
+}, trackerDate).contextWindow.status, "unknown");
+{
+  let combinedPayload;
+  const client = Object.create(CombinedUsageClient.prototype);
+  Object.assign(client, {
+    officialView: {}, localOfficialView: { currentThreadId: mergeThreadId, contextWindow: mergedContext.contextWindow },
+    accountView: {}, apiView: { id: "api-key" }, forecastView: {}, refreshMs: 60000,
+    onUpdate: value => { combinedPayload = value; },
+  });
+  client.emit();
+  assert.equal(combinedPayload.contextWindow.percent, 70, "the injected payload exposes contextWindow at its root");
+  assert.equal(combinedPayload.sources.session.metrics.find(m => m.id === "contextUsage").value, "≈70%");
+}
+assert.equal(delayedSessionSource.label, "本会话");
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "executionTime").value, "11分31秒");
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "executionTime").durationMs, 691323);
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "executionTime").sampledAt, trackerDate.toISOString());
+assert.equal(delayedSessionSource.metrics.some((item) => item.id === "currentStatus"), false);
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "autoResume").value, "--");
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "currentTaskTokens").label, "当前会话累计 Token");
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "currentTaskTokens").value, "190");
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "lastTurnTokens").label, "上次回答消耗 Token");
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "lastTurnTokens").value, "40");
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "cacheHitRate").value, "75.3%");
+assert.equal(delayedSessionSource.metrics.find((item) => item.id === "contextCompactions").value, "3");
+const localZeroOverridesOfficialBucket = mergeOfficialLocalUsage({ ...view, todayTokens: 120 }, {
+  dailyDate: trackerDateKey,
+  todayTokens: 0,
+}, trackerDate);
+assert.equal(localZeroOverridesOfficialBucket.todayTokens, 0);
+assert.equal(localZeroOverridesOfficialBucket.todayTokenScope, "local-official-conversations");
+
+const reversed = toOfficialUsageSource({ ...view, windows: [...view.windows].reverse() }, now.getTime());
+assert.equal(reversed.metrics.find((item) => item.id === "primaryRemaining").value, "68%");
+assert.equal(reversed.metrics.find((item) => item.id === "secondaryRemaining").value, "42%");
+const fiveHourOnly = toOfficialUsageSource({ ...view, windows: [view.windows[0]] }, now.getTime());
+assert.equal(fiveHourOnly.metrics.find((item) => item.id === "primaryRemaining").value, "68%");
+assert.equal(fiveHourOnly.metrics.find((item) => item.id === "secondaryRemaining").value, "--");
+assert.notEqual(fiveHourOnly.metrics.find((item) => item.id === "primaryReset").value, "--");
+const sevenDayOnly = toOfficialUsageSource({ ...view, windows: [view.windows[1]] }, now.getTime());
+assert.equal(sevenDayOnly.metrics.find((item) => item.id === "primaryRemaining").value, "--");
+assert.equal(sevenDayOnly.metrics.find((item) => item.id === "secondaryRemaining").value, "42%");
+assert.notEqual(sevenDayOnly.metrics.find((item) => item.id === "primaryReset").value, "--");
+const noOfficialWindows = toOfficialUsageSource({ ...view, windows: [] }, now.getTime());
+assert.equal(noOfficialWindows.metrics.find((item) => item.id === "primaryReset").value, "--");
+const noSessionUsage = toSessionUsageSource({ ...view, currentThreadId: null, currentStatus: null, currentTaskTokens: null, lastTurnTokens: null, cacheHitRate: null, contextCompactions: null }, now.getTime());
+assert.equal(noSessionUsage.status, "unavailable");
+assert.deepEqual(noSessionUsage.metrics.map((item) => item.value), ["--", "--", "--", "--", "--", "--", "--", "--"]);
+
+const cctq = normalizeCctqUsageView({
+  data: { total_granted: 7500000, total_used: 2500000, unlimited_quota: false, expires_at: 0 },
+}, {
+  data: { quota_per_unit: 500000, quota_display_type: "CNY" },
+}, now.getTime());
+assert.equal(cctq.metrics.find((item) => item.id === "usedAmount").value, "¥5.0");
+assert.equal(cctq.metrics.find((item) => item.id === "quotaLimit").value, "¥15.0");
+assert.equal(cctq.metrics.find((item) => item.id === "expiresAt").value, "永久");
+
+const customProvider = validateApiProviderConfig({
+  schemaVersion: 1,
+  id: "acme",
+  label: "Acme API",
+  baseUrl: "https://api.example.com/",
+  requests: { usagePath: "/v2/usage", statusPath: null },
+  auth: { header: "X-API-Key", scheme: "" },
+  response: {
+    usageRoot: "result.account",
+    statusRoot: "result.account",
+    used: "quota.used",
+    limit: "quota.limit",
+    unlimited: "quota.unlimited",
+    expiresAt: "subscription.expires",
+    quotaPerUnit: "display.perUnit",
+    currency: "display.currency",
+    defaultQuotaPerUnit: 100,
+    defaultCurrency: "USD",
+  },
+});
+assert.equal(customProvider.baseUrl, "https://api.example.com");
+assert.equal(customProvider.auth.header, "X-API-Key");
+const custom = normalizeApiUsageView({
+  result: {
+    account: {
+      quota: { used: 1234, limit: 5000, unlimited: "false" },
+      subscription: { expires: "2026-07-25T00:00:00Z" },
+      display: { perUnit: 100, currency: "USD" },
+    },
+  },
+}, null, customProvider, now.getTime());
+assert.equal(custom.id, "acme");
+assert.equal(custom.label, "Acme API");
+assert.equal(custom.accountType, "api-key");
+assert.equal(custom.metrics.find((item) => item.id === "usedAmount").value, "$12.3");
+assert.equal(custom.metrics.find((item) => item.id === "quotaLimit").value, "$50.0");
+assert.equal(custom.metrics.find((item) => item.id === "expiresAt").value, "3天后");
+
+const noLimitProvider = validateApiProviderConfig({
+  schemaVersion: 1,
+  id: "raw",
+  label: "Raw API",
+  baseUrl: "http://127.0.0.1:8080",
+  requests: { usagePath: "/usage", statusPath: null },
+  auth: {},
+  response: { used: "used", limit: null, unlimited: null, defaultQuotaPerUnit: 1, defaultCurrency: "" },
+});
+const noLimit = normalizeApiUsageView({ used: 123 }, null, noLimitProvider, now.getTime());
+assert.equal(noLimit.metrics.find((item) => item.id === "usedAmount").value, "123.0");
+assert.equal(noLimit.metrics.find((item) => item.id === "quotaLimit").value, "不限");
+
+const baseProvider = {
+  schemaVersion: 1,
+  id: "test",
+  label: "Test API",
+  baseUrl: "https://api.example.com",
+  requests: { usagePath: "/usage", statusPath: null },
+  auth: {},
+  response: { used: "used" },
+};
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, baseUrl: "https://user:pass@example.com" }), /不能包含凭据/);
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, baseUrl: "file:///tmp/data" }), /HTTP/);
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, baseUrl: "http://api.example.com" }), /HTTPS/);
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, baseUrl: "https://api.example.com?tenant=1" }), /查询参数/);
+assert.equal(normalizeCredentialBaseUrl("http://localhost:8080/"), "http://localhost:8080");
+assert.equal(normalizeCredentialBaseUrl("http://[::1]:8080/"), "http://[::1]:8080");
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, requests: { usagePath: "//evil.example/usage" } }), /站内路径/);
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, auth: { header: "X-Key\r\nHost", scheme: "" } }), /请求头/);
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, auth: { header: "Cookie", scheme: "" } }), /受保护/);
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, credentials: { apiKey: "not-allowed" } }), /不支持的字段/);
+assert.throws(() => validateApiProviderConfig({ ...baseProvider, response: { used: "used", secret: "value" } }), /不支持的字段/);
+assert.equal(loadApiProviderConfig().id, "cctq");
+assert.throws(() => new ApiUsageClient({ provider: baseProvider, apiKey: "line\nbreak" }), /单行 ASCII/);
+assert.throws(() => new ApiAccountUsageClient({ token: "line\nbreak", userId: "10530" }), /单行 ASCII/);
+assert.throws(() => new ApiAccountUsageClient({ token: "token", userId: "0" }), /用户 ID/);
+
+const directRequestRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-direct-request-test-"));
+const originalFetch = globalThis.fetch;
+try {
+  let apiFetchOptions;
+  globalThis.fetch = async (_url, options) => {
+    apiFetchOptions = options;
+    return new Response('{"used":1}', { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const directApiClient = new ApiUsageClient({ provider: baseProvider, apiKey: "test-key" });
+  assert.deepEqual(await directApiClient.requestJson("https://api.example.com/usage"), { used: 1 });
+  assert.equal(apiFetchOptions.redirect, "error");
+  assert.equal(apiFetchOptions.headers.Authorization, "Bearer test-key");
+
+  let accountFetchOptions;
+  globalThis.fetch = async (_url, options) => {
+    accountFetchOptions = options;
+    return new Response('{"data":{}}', { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const directAccountClient = new ApiAccountUsageClient({ baseUrl: "http://127.0.0.1:8080", token: "account-token", userId: "10530", counterPath: path.join(directRequestRoot, "counter.json") });
+  assert.deepEqual(await directAccountClient.requestJson("/api/user/self"), { data: {} });
+  assert.equal(accountFetchOptions.redirect, "error");
+  assert.equal(accountFetchOptions.headers.Authorization, "Bearer account-token");
+  assert.throws(() => new ApiAccountUsageClient({ baseUrl: "http://api.example.com", token: "x", userId: "1", counterPath: null }), /HTTPS/);
+
+  globalThis.fetch = async () => new Response(new Uint8Array((2 * 1024 * 1024) + 1), { status: 200 });
+  await assert.rejects(() => directApiClient.requestJson("https://api.example.com/usage"), /响应过大/);
+} finally {
+  globalThis.fetch = originalFetch;
+  rmSync(directRequestRoot, { recursive: true, force: true });
+}
+
+const resilientProvider = validateApiProviderConfig({
+  ...baseProvider,
+  requests: { usagePath: "/usage", statusPath: "/status" },
+  response: {
+    used: "used",
+    quotaPerUnit: "quotaPerUnit",
+    currency: "currency",
+    defaultQuotaPerUnit: 1,
+    defaultCurrency: "USD",
+  },
+});
+const apiUpdates = [];
+const apiClient = new ApiUsageClient({ provider: resilientProvider, apiKey: "test-key", onUpdate: (value) => apiUpdates.push(value) });
+let statusAvailable = true;
+let usedAmount = 100;
+apiClient.requestJson = async (url) => {
+  if (url.endsWith("/status")) {
+    if (!statusAvailable) throw new Error("status unavailable");
+    return { quotaPerUnit: 100, currency: "CNY" };
+  }
+  return { used: usedAmount };
+};
+await apiClient.refresh();
+assert.equal(apiUpdates.at(-1).metrics.find((item) => item.id === "usedAmount").value, "¥1.0");
+statusAvailable = false;
+usedAmount = 250;
+await apiClient.refresh();
+assert.equal(apiUpdates.at(-1).status, "ready");
+assert.equal(apiUpdates.at(-1).metrics.find((item) => item.id === "usedAmount").value, "¥2.5");
+
+let rateLimitNow = 1784700000000;
+let rateLimitRequests = 0;
+let rateLimited = false;
+const rateLimitUpdates = [];
+const rateLimitClient = new ApiUsageClient({
+  provider: validateApiProviderConfig({ ...baseProvider, response: { used: "used" } }),
+  apiKey: "test-key",
+  now: () => rateLimitNow,
+  onUpdate: (value) => rateLimitUpdates.push(value),
+});
+rateLimitClient.requestJson = async () => {
+  rateLimitRequests += 1;
+  if (rateLimited) {
+    const error = new Error("rate limited");
+    error.status = 429;
+    throw error;
+  }
+  return { used: 12 };
+};
+await rateLimitClient.refresh();
+assert.equal(rateLimitUpdates.at(-1).status, "ready");
+const successfulMetrics = rateLimitUpdates.at(-1).metrics;
+rateLimited = true;
+await rateLimitClient.refresh();
+assert.equal(rateLimitUpdates.at(-1).status, "rate-limited");
+assert.match(rateLimitUpdates.at(-1).error, /HTTP 429/);
+assert.deepEqual(rateLimitUpdates.at(-1).metrics, successfulMetrics);
+assert.equal(rateLimitUpdates.at(-1).nextRefreshAt, rateLimitNow + 60000);
+rateLimitNow += 30000;
+await rateLimitClient.refresh();
+assert.equal(rateLimitRequests, 2);
+assert.equal(rateLimitUpdates.at(-1).status, "rate-limited");
+rateLimitNow += 30000;
+rateLimited = false;
+await rateLimitClient.refresh();
+assert.equal(rateLimitRequests, 3);
+assert.equal(rateLimitUpdates.at(-1).status, "ready");
+
+const accountNow = new Date(2026, 6, 22, 12, 0, 0).getTime();
+const account = normalizeApiAccountView({ data: { quota: 5000000, used_quota: 1250000 } }, [
+  { created_at: Math.floor((accountNow - 10 * 60000) / 1000), prompt_tokens: 1200, completion_tokens: 300, quota: 250000, model_name: "gpt-5.6-sol", use_time: 842 },
+  { created_at: Math.floor((accountNow - 3 * 3600000) / 1000), prompt_tokens: 5000, completion_tokens: 700, quota: 400000, model_name: "gpt-5.5", use_time: 1200 },
+  { created_at: Math.floor((accountNow - 13 * 3600000) / 1000), prompt_tokens: 100, completion_tokens: 0, quota: 10000, model_name: "gpt-5.5", use_time: 300 },
+  { created_at: Math.floor((accountNow - 2 * 86400000) / 1000), prompt_tokens: 10000, completion_tokens: 2000, quota: 800000, model_name: "gpt-5.4", use_time: 1600 },
+], { now: accountNow, refreshMs: 90000 });
+assert.equal(account.accountType, "api-account");
+assert.equal(account.metrics.length, 8);
+assert.equal(account.metrics.find((item) => item.id === "balance").value, "¥10.0");
+assert.equal(account.metrics.find((item) => item.id === "usedQuota").value, "¥2.5");
+assert.equal(account.metrics.find((item) => item.id === "totalTokens").value, "2万");
+assert.equal(account.metrics.find((item) => item.id === "todayTokens").value, "7,200");
+assert.equal(account.metrics.find((item) => item.id === "todayTokens").label, "今日 Token");
+assert.equal(account.metrics.find((item) => item.id === "totalTokens").label, "累计 Token");
+assert.equal(account.metrics.find((item) => item.id === "lastQuota").value, "¥0.500");
+assert.equal(account.metrics.find((item) => item.id === "lastModel").value, "gpt-5.6-sol");
+assert.equal(account.metrics.find((item) => item.id === "lastModel").label, "上次响应模型");
+assert.match(account.metrics.find((item) => item.id === "lastRequestAt").value, /^2026-07-22 11:50$/);
+assert.equal(account.metrics.find((item) => item.id === "lastLatency").value, "842ms");
+
+const persistedToday = normalizeApiAccountView({ data: { quota: 5000000, used_quota: 1250000 } }, [], {
+  now: accountNow,
+  persistentTodayTokens: 123456,
+});
+assert.equal(persistedToday.metrics.find((item) => item.id === "todayTokens").value, "12万");
+
+const automaticCounterRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-auto-counter-test-"));
+try {
+  const automaticCounterPath = path.join(automaticCounterRoot, "counter.json");
+  const accountUpdates = [];
+  const accountClient = new ApiAccountUsageClient({ token: "account-token", userId: "10530", counterPath: automaticCounterPath, now: () => accountNow, onUpdate: (value) => accountUpdates.push(value) });
+  const requestedLogPages = [];
+  accountClient.requestJson = async (pathname, query) => {
+    if (pathname === "/api/user/self") return { data: { quota: 1000000, used_quota: 500000 } };
+    requestedLogPages.push(query.p);
+    if (query.p === 1) return { data: { total: 201, page_size: 100, items: [{ id: 1, created_at: Math.floor(accountNow / 1000), prompt_tokens: 2, completion_tokens: 3 }] } };
+    if (query.p === 2) return { data: { page: 2, total: 201, page_size: 100, items: [{ id: 2, created_at: Math.floor(accountNow / 1000) - 1, prompt_tokens: 5, completion_tokens: 7 }] } };
+    return { data: { page: 3, total: 201, page_size: 100, items: [{ id: 3, created_at: Math.floor(accountNow / 1000) - 2, prompt_tokens: 11, completion_tokens: 8 }] } };
+  };
+  await accountClient.refresh();
+  assert.equal(accountUpdates.at(-1).status, "ready");
+  assert.equal(accountUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "36");
+  assert.equal(accountUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "36");
+  assert.equal(accountUpdates.at(-1).error, null);
+  assert.equal(accountUpdates.at(-1).nextRefreshAt - accountUpdates.at(-1).fetchedAt, 60000);
+  assert.deepEqual(requestedLogPages, [1, 2, 3]);
+  await accountClient.refresh();
+  assert.deepEqual(requestedLogPages, [1, 2, 3, 1]);
+  assert.equal(accountUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "36");
+  assert.equal(accountUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "36");
+  assert.equal(accountUpdates.at(-1).error, null);
+  await accountClient.refresh();
+  assert.deepEqual(requestedLogPages, [1, 2, 3, 1, 1]);
+  assert.equal(accountUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "36");
+
+  const restartedUpdates = [];
+  const restartedClient = new ApiAccountUsageClient({ token: "account-token", userId: "10530", counterPath: automaticCounterPath, now: () => accountNow, onUpdate: (value) => restartedUpdates.push(value) });
+  restartedClient.requestJson = accountClient.requestJson;
+  await restartedClient.refresh();
+  assert.equal(restartedUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "36");
+  assert.equal(restartedUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "36");
+
+  const incompleteUpdates = [];
+  const incompleteClient = new ApiAccountUsageClient({ token: "account-token", userId: "10530", counterPath: automaticCounterPath, now: () => accountNow + 1000, onUpdate: (value) => incompleteUpdates.push(value) });
+  incompleteClient.requestJson = async (pathname, query) => {
+    if (pathname === "/api/user/self") return { data: { quota: 1000000, used_quota: 500000 } };
+    if (query.p === 1) return { data: { total: 201, page_size: 100, items: [{ id: 1, created_at: Math.floor((accountNow + 1000) / 1000), prompt_tokens: 100, completion_tokens: 50 }] } };
+    if (query.p === 2) throw new Error("temporary history failure");
+    return { data: { page: 3, total: 201, page_size: 100, items: [] } };
+  };
+  await incompleteClient.refresh();
+  assert.equal(incompleteUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "36");
+  assert.equal(incompleteUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "36");
+  assert.match(incompleteUpdates.at(-1).error, /账本保留原值/);
+} finally {
+  rmSync(automaticCounterRoot, { recursive: true, force: true });
+}
+
+const counterRoot = mkdtempSync(path.join(os.tmpdir(), "codex-usage-counter-test-"));
+try {
+  const counterPath = path.join(counterRoot, "counter.json");
+  writeFileSync(counterPath, JSON.stringify({
+    schemaVersion: 1,
+    initialTokens: 500,
+    totalTokens: 500,
+    checkpointAt: accountNow - 1000,
+    recentLogIds: [],
+    configuredAt: new Date(accountNow - 1000).toISOString(),
+    updatedAt: new Date(accountNow - 1000).toISOString(),
+  }));
+  const counterUpdates = [];
+  let counterNow = accountNow;
+  let counterLog = { id: 99, created_at: Math.floor(accountNow / 1000), prompt_tokens: 2, completion_tokens: 3 };
+  const counterClient = new ApiAccountUsageClient({ token: "account-token", userId: "10530", counterPath, now: () => counterNow, onUpdate: (value) => counterUpdates.push(value) });
+  counterClient.requestJson = async (pathname) => pathname === "/api/user/self"
+    ? { data: { quota: 1000000, used_quota: 500000 } }
+    : { data: { page: 1, page_size: 100, total: 1, items: [counterLog] } };
+  await counterClient.refresh();
+  assert.equal(counterUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "505");
+  assert.equal(counterUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "5");
+  const migratedCounter = JSON.parse(readFileSync(counterPath, "utf8"));
+  assert.equal(migratedCounter.schemaVersion, 5);
+  assert.equal(migratedCounter.dailyTokens, 5);
+  await counterClient.refresh();
+  assert.equal(counterUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "505");
+  assert.equal(counterUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "5");
+
+  counterNow += 86400000;
+  counterLog = { id: 100, created_at: Math.floor(counterNow / 1000), prompt_tokens: 7, completion_tokens: 11 };
+  await counterClient.refresh();
+  assert.equal(counterUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "523");
+  assert.equal(counterUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "18");
+  const nextDayCounter = JSON.parse(readFileSync(counterPath, "utf8"));
+  assert.equal(nextDayCounter.dailyTokens, 18);
+  assert.equal(nextDayCounter.dailyLogIds.length, 1);
+
+  writeFileSync(counterPath, JSON.stringify({
+    schemaVersion: 3,
+    baselineConfigured: true,
+    baselineSnapshotComplete: true,
+    initialTokens: 500,
+    totalTokens: 500,
+    checkpointAt: accountNow + 60000,
+    recentLogIds: [],
+    dailyDate: "2026-07-22",
+    dailyTokens: 0,
+    dailyLogIds: [],
+  }));
+  const delayedUpdates = [];
+  const delayedClient = new ApiAccountUsageClient({ token: "account-token", userId: "10530", counterPath, now: () => accountNow, onUpdate: (value) => delayedUpdates.push(value) });
+  delayedClient.requestJson = async (pathname) => pathname === "/api/user/self"
+    ? { data: { quota: 1000000, used_quota: 500000 } }
+    : { data: { page: 1, page_size: 100, total: 1, items: [{ id: 101, created_at: Math.floor(accountNow / 1000), prompt_tokens: 2, completion_tokens: 3 }] } };
+  await delayedClient.refresh();
+  assert.equal(delayedUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "500");
+
+  writeFileSync(counterPath, JSON.stringify({
+    schemaVersion: 4,
+    baselineConfigured: true,
+    initialTokens: 500,
+    totalTokens: 450,
+    checkpointAt: accountNow,
+    recentLogIds: ["id:102"],
+    dailyDate: "2026-07-22",
+    dailyTokens: 5,
+    dailyLogIds: ["id:102"],
+  }));
+  const legacyUpdates = [];
+  const legacyClient = new ApiAccountUsageClient({ token: "account-token", userId: "10530", counterPath, now: () => accountNow, onUpdate: (value) => legacyUpdates.push(value) });
+  legacyClient.requestJson = async (pathname) => pathname === "/api/user/self"
+    ? { data: { quota: 1000000, used_quota: 500000 } }
+    : { data: { page: 1, page_size: 100, total: 1, items: [{ id: 102, created_at: Math.floor(accountNow / 1000), prompt_tokens: 5, completion_tokens: 0 }] } };
+  await legacyClient.refresh();
+  assert.equal(legacyUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "500");
+
+  const baselineLog = { id: 1, created_at: Math.floor(accountNow / 1000), prompt_tokens: 2, completion_tokens: 3, quota: 10, model_name: "gpt", use_time: 50 };
+  writeFileSync(counterPath, JSON.stringify({
+    schemaVersion: 5,
+    baselineConfigured: true,
+    initialTokens: 500,
+    totalTokens: 500,
+    checkpointAt: accountNow,
+    recentLogIds: [accountLogIdentity(baselineLog)],
+    dailyDate: "2026-07-22",
+    dailyTokens: 5,
+    dailyCheckpointAt: accountNow,
+    dailyLogIds: [accountLogIdentity(baselineLog)],
+  }));
+  const immutableUpdates = [];
+  let immutableLog = baselineLog;
+  const immutableClient = new ApiAccountUsageClient({ token: "account-token", userId: "10530", counterPath, now: () => accountNow + 2000, onUpdate: (value) => immutableUpdates.push(value) });
+  immutableClient.requestJson = async (pathname) => pathname === "/api/user/self"
+    ? { data: { quota: 1000000, used_quota: 500000 } }
+    : { data: { page: 1, page_size: 100, total: 1, items: [immutableLog] } };
+  await immutableClient.refresh();
+  assert.equal(immutableUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "500");
+  immutableLog = { id: 1, created_at: Math.floor((accountNow + 1000) / 1000), prompt_tokens: 10, completion_tokens: 5, quota: 20, model_name: "gpt", use_time: 60 };
+  await immutableClient.refresh();
+  assert.equal(immutableUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "515");
+  assert.equal(immutableUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "20");
+  immutableLog = { ...immutableLog, id: 999 };
+  await immutableClient.refresh();
+  assert.equal(immutableUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "515");
+  immutableLog = { id: 1, created_at: Math.floor((accountNow + 1000) / 1000), prompt_tokens: 7, completion_tokens: 3, quota: 21, model_name: "gpt", use_time: 61 };
+  await immutableClient.refresh();
+  assert.equal(immutableUpdates.at(-1).metrics.find((item) => item.id === "totalTokens").value, "525");
+  assert.equal(immutableUpdates.at(-1).metrics.find((item) => item.id === "todayTokens").value, "30");
+} finally {
+  rmSync(counterRoot, { recursive: true, force: true });
+}
+
+const merged = mergeRateLimitSnapshot(rateLimits.rateLimits, { primary: { usedPercent: 40 }, secondary: null, planType: null });
+assert.deepEqual(merged.primary, { usedPercent: 40, windowDurationMins: 300, resetsAt: 1784700000 });
+assert.deepEqual(merged.secondary, rateLimits.rateLimits.secondary);
+assert.equal(normalizeUsageView(null, null, now).status, "unavailable");
+
+const forecastPayload = {
+  schemaVersion: "public-v1",
+  dataHealth: { overall: "ok", stale: false },
+  viewModel: { probability12h: 0.335, probability24h: 0.558, probability48h: 0.72, probability72h: 0.852 },
+  latestTiboActivity: {
+    text: "Codex usage has been reset for all paid plans.",
+    createdAt: "2026-09-01T08:49:05+08:00",
+    sourceUrl: "https://x.com/thsottiaux/status/2094588317245509959",
+  },
+};
+const forecastView = normalizeResetForecastView(forecastPayload, { now: 1000 });
+assert.equal(forecastView.accountType, "forecast");
+assert.equal(forecastView.status, "ready");
+assert.equal(forecastView.resetMethod, "unknown");
+for (const [activeWindow, expected] of [
+  [{ active: true, kind: "official", noticeKind: "banked" }, "banked"],
+  [{ active: true, kind: "official", noticeKind: "forced" }, "forced"],
+  [{ active: false, kind: "official", noticeKind: "banked" }, "unknown"],
+  [{ active: true, kind: "regular", noticeKind: "forced" }, "unknown"],
+  [{ active: true, kind: "official", noticeKind: "new-kind" }, "unknown"],
+]) {
+  const view = normalizeResetForecastView({ ...forecastPayload, viewModel: { ...forecastPayload.viewModel, activeWindow } });
+  assert.equal(view.resetMethod, expected);
+  assert.equal(normalizeResetForecastView(null, { previous: view }).resetMethod, expected);
+}
+assert.deepEqual(forecastView.metrics.map((item) => item.value), ["33.5%", "55.8%", "72.0%", "85.2%"]);
+assert.equal(forecastView.latestActivity.text, "Codex usage has been reset for all paid plans.");
+assert.equal(forecastView.latestActivity.sourceUrl, "https://x.com/thsottiaux/status/2094588317245509959");
+assert.equal(forecastView.latestActivity.nextRefreshAt, 1000 + TIBO_ACTIVITY_REFRESH_MS);
+const changedTiboPayload = {
+  ...forecastPayload,
+  latestTiboActivity: {
+    ...forecastPayload.latestTiboActivity,
+    text: "A newer Tibo post.",
+    createdAt: "2026-09-01T09:49:05+08:00",
+    sourceUrl: "https://x.com/thsottiaux/status/2094588317245509960",
+  },
+};
+assert.equal(normalizeResetForecastView(changedTiboPayload, { previous: forecastView, now: 1000 + 2 * 60 * 1000 }).latestActivity.text, forecastView.latestActivity.text);
+assert.equal(normalizeResetForecastView(changedTiboPayload, { previous: forecastView, now: 1000 + TIBO_ACTIVITY_REFRESH_MS }).latestActivity.text, "A newer Tibo post.");
+assert.equal(normalizeResetForecastView({ ...forecastPayload, latestTiboActivity: { ...forecastPayload.latestTiboActivity, sourceUrl: "https://example.com/post" } }, { now: 1000 }).latestActivity, null);
+assert.equal(normalizeResetForecastView({ schemaVersion: "bad" }, { previous: forecastView, now: 2000 }).status, "stale");
+let forecastRequests = 0;
+const forecastUpdates = [];
+const forecastClient = new ResetForecastClient({
+  managed: true,
+  onUpdate: (value) => forecastUpdates.push(value),
+  fetchImpl: async (_url, options) => {
+    forecastRequests += 1;
+    assert.equal(options.method, "GET");
+    assert.equal(options.redirect, "error");
+    return new Response(JSON.stringify(forecastPayload), { status: 200, headers: { "content-type": "application/json" } });
+  },
+});
+await forecastClient.start();
+assert.equal(forecastRequests, 1);
+assert.equal(forecastUpdates.at(-1).status, "ready");
+await forecastClient.refresh();
+assert.equal(forecastRequests, 1);
+await forecastClient.stop();
+
+console.log("PASS: official usage, reset forecast, API account aggregation, generic API mapping, provider validation, CCTQ compatibility, and sparse updates.");
+
+// Changing the interval replaces the timer, keeping all managed sources synchronized.
+{
+  const client = Object.create(CombinedUsageClient.prototype);
+  Object.assign(client, { refreshMs: 60000, timer: null, emit() {}, official: {}, account: {}, api: {}, forecast: { refreshMs: 300000 } });
+  try {
+    client.scheduleRefresh();
+    const previous = client.timer;
+    client.setRefreshInterval(30000);
+    assert.notEqual(client.timer, previous);
+    assert.equal(previous._destroyed, true);
+    assert.equal(client.timer._idleTimeout, 30000);
+    assert.ok(client.nextRefreshAt - Date.now() <= 30000);
+    for (const source of [client.official, client.account, client.api]) assert.equal(source.refreshMs, 30000);
+    assert.equal(client.forecast.refreshMs, 300000);
+    const timer = client.timer;
+    client.setRefreshInterval(30000);
+    assert.equal(client.timer, timer);
+    client.setRefreshInterval(60000);
+    assert.equal(timer._destroyed, true);
+    assert.equal(client.timer._idleTimeout, 60000);
+    client.setRefreshInterval(0);
+    assert.equal(client.refreshMs, 60000);
+  } finally { clearInterval(client.timer); }
+}
