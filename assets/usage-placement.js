@@ -1,0 +1,318 @@
+(() => {
+  const registry = window.__CODEX_USAGE_MONITOR_MODULES__ ||= {};
+  const COMPOSER_SELECTORS = Object.freeze([
+    ".composer-surface-chrome",
+    '[data-testid="composer"]',
+    '[data-testid*="composer-"]',
+    '[class*="ComposerLayoutRoot"]',
+  ]);
+  const EDITABLE_SELECTOR = 'textarea, [contenteditable="true"]';
+  const CONTROL_SELECTOR = 'button, [role="button"]';
+  const APPROVAL_PATTERN = /(?:替我审批|请求批准|完全访问(?:权限)?|自定义(?:\s*\(config\.toml\))?|approve|approval|full access|custom\s*\(config\.toml\))/i;
+
+  const box = (node) => {
+    if (!node) return null;
+    const rect = node.getBoundingClientRect();
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, right: rect.right, bottom: rect.bottom };
+  };
+  const isVisible = (node) => {
+    const rect = node?.getBoundingClientRect();
+    return Boolean(rect && rect.width > 0 && rect.height > 0);
+  };
+  const controlText = (node) => `${node?.getAttribute?.("aria-label") || ""} ${node?.getAttribute?.("title") || ""} ${node?.textContent || ""}`.trim();
+  const isApprovalControl = (node) => APPROVAL_PATTERN.test(controlText(node));
+  const composerSelector = COMPOSER_SELECTORS.join(", ");
+  let reservedComposer = null;
+  const clearPlacement = () => {
+    if (!reservedComposer) return;
+    const { node, value, priority } = reservedComposer;
+    if (value) node.style.setProperty("padding-bottom", value, priority);
+    else node.style.removeProperty("padding-bottom");
+    reservedComposer = null;
+  };
+
+  // ChatGPT Chat and Work share ComposerLayoutRoot and the top-level mode.
+  // Use field metadata, never message contents or the global ChatGPT selector.
+  const isChatGptComposer = (node) => {
+    const fields = node.matches(EDITABLE_SELECTOR) ? [node] : [...node.querySelectorAll(EDITABLE_SELECTOR)];
+    const labels = fields.flatMap((field) => ["aria-label", "placeholder", "data-placeholder"]
+      .map((attribute) => field.getAttribute(attribute) || ""));
+    if (labels.some((label) => /\bChatGPT\s+(?:Work\b|工作)/i.test(label))) return false;
+    if (labels.some((label) => /\bChatGPT\b/i.test(label))) return true;
+    for (let current = node; current; current = current.parentElement) {
+      if (["data-above-composer-conversation-id", "data-conversation-id", "data-thread-id"]
+        .some((attribute) => /^chatgpt\s*:/i.test(current.getAttribute(attribute) || ""))) return true;
+    }
+    return false;
+  };
+
+  const isDotComposer = (node) => {
+    for (let current = node; current; current = current.parentElement) {
+      if (current.style.getPropertyValue("--orbit-message-link-color")
+        || current.style.getPropertyValue("--orbit-messages-content-x")) return true;
+    }
+    return false;
+  };
+
+  const findPlacement = (hostId, preferredComposer = null) => {
+    const composers = [...document.querySelectorAll(composerSelector)]
+      .filter((node) => isVisible(node) && !isChatGptComposer(node) && !isDotComposer(node));
+    const visibleEditables = [...document.querySelectorAll(EDITABLE_SELECTOR)]
+      .filter((node) => isVisible(node) && !node.closest(`#${hostId}`));
+    const editables = visibleEditables.filter((node) => !isChatGptComposer(node) && !isDotComposer(node));
+    const nearestComposer = (editable) => {
+      const explicit = editable.closest(composerSelector);
+      if (explicit && isVisible(explicit)) return { composer: explicit, strategy: "explicit-editable" };
+      let current = editable.parentElement;
+      for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+        const rect = box(current);
+        if (rect && rect.height >= 56 && rect.height <= 260 && current.querySelectorAll(CONTROL_SELECTOR).length >= 2) {
+          return { composer: current, strategy: `editable-ancestor-${depth + 1}` };
+        }
+      }
+      return null;
+    };
+    const preferredEditable = preferredComposer && preferredComposer.isConnected && isVisible(preferredComposer)
+      ? editables.find((editable) => preferredComposer.contains(editable))
+      : null;
+    const preferredMatch = preferredEditable ? nearestComposer(preferredEditable) : null;
+    const candidates = editables
+      .map((editable, order) => {
+        const match = nearestComposer(editable);
+        return match ? { ...match, editable, order } : null;
+      })
+      .filter(Boolean)
+      .filter((candidate, index, all) => all.findIndex((item) => item.composer === candidate.composer) === index);
+    const candidateScore = (candidate) => {
+      const controls = [...candidate.composer.querySelectorAll(CONTROL_SELECTOR)]
+        .filter((node) => isVisible(node) && !node.closest(`#${hostId}`));
+      const composerBox = box(candidate.composer);
+      return {
+        approval: controls.some(isApprovalControl) ? 1 : 0,
+        explicit: candidate.composer.matches(composerSelector) ? 1 : 0,
+        x: composerBox?.x ?? Number.POSITIVE_INFINITY,
+        order: candidate.order,
+      };
+    };
+    const fallbackMatch = candidates.sort((left, right) => {
+      const leftScore = candidateScore(left);
+      const rightScore = candidateScore(right);
+      return rightScore.approval - leftScore.approval
+        || rightScore.explicit - leftScore.explicit
+        || leftScore.x - rightScore.x
+        || leftScore.order - rightScore.order;
+    })[0] || (composers.length ? { composer: composers.at(-1), strategy: "explicit-composer" } : null);
+    const match = preferredMatch || fallbackMatch;
+    if (!match) {
+      return {
+        composer: null,
+        strategy: "none",
+        reason: visibleEditables.length && !editables.length
+          ? visibleEditables.some(isDotComposer) ? "dot-composer" : "chatgpt-composer"
+          : editables.length ? "composer-not-found-for-editable" : "visible-editable-not-found",
+        editableCount: editables.length,
+        composerCount: composers.length,
+      };
+    }
+    return { ...match, reason: null, editableCount: editables.length, composerCount: composers.length };
+  };
+
+  const configureTitlebarPosition = (host, hostId) => {
+    const titlebar = [...document.querySelectorAll('[class*="ApplicationMenuTopBar"], [data-testid="window-titlebar"], [data-testid="titlebar"], header.draggable')]
+      .find((node) => {
+        const rect = box(node);
+        return isVisible(node) && getComputedStyle(node).visibility !== "hidden"
+          && rect.y >= 0 && rect.y <= 8 && rect.height >= 28 && rect.height <= 64 && rect.width >= 240;
+      });
+    if (!titlebar) return null;
+    const titlebarBox = box(titlebar);
+    const titlebarStyle = getComputedStyle(titlebar);
+    let left = Math.max(8, titlebarBox.x + (Number.parseFloat(titlebarStyle.paddingLeft) || 0));
+    let right = Math.min(window.innerWidth - 8, titlebarBox.right - (Number.parseFloat(titlebarStyle.paddingRight) || 0));
+    // Electron exposes native caption-button space through the controls overlay;
+    // the current Codex titlebar also reserves this space with padding-right.
+    try {
+      const overlay = window.navigator?.windowControlsOverlay;
+      const area = overlay?.visible ? overlay.getTitlebarAreaRect() : null;
+      if (area && area.width > 0) {
+        left = Math.max(left, area.x + 8);
+        right = Math.min(right, area.x + area.width - 8);
+      }
+    } catch {}
+    const occupied = [...titlebar.querySelectorAll('button, [role="button"], a, input, select, [tabindex], .no-drag')]
+      .filter((node) => !node.closest(`#${hostId}`) && isVisible(node))
+      .map(box)
+      .filter((rect) => rect.y < titlebarBox.bottom && rect.bottom > titlebarBox.y && rect.right > left && rect.x < right)
+      .sort((a, b) => a.x - b.x);
+    const gaps = [];
+    let cursor = left;
+    for (const rect of occupied) {
+      if (rect.x > cursor) gaps.push({ left: cursor, right: Math.min(right, rect.x) });
+      cursor = Math.max(cursor, rect.right);
+    }
+    if (cursor < right) gaps.push({ left: cursor, right });
+    const gap = gaps.map((value) => ({ left: value.left + 8, right: value.right - 8 }))
+      .sort((a, b) => (b.right - b.left) - (a.right - a.left))[0];
+    const available = gap ? Math.floor(gap.right - gap.left) : 0;
+    if (available < 104) return null;
+    clearPlacement();
+    const reference = titlebar.querySelector('button, [role="button"]') || titlebar;
+    const referenceStyle = getComputedStyle(reference);
+    host.style.setProperty("--usage-color", referenceStyle.color);
+    if (referenceStyle.fontSize) host.style.setProperty("--usage-font-size", referenceStyle.fontSize);
+    host.style.setProperty("--usage-max-width", `${available}px`);
+    host.style.setProperty("--usage-titlebar-height", `${Math.floor(titlebarBox.height)}px`);
+    host.hidden = false;
+    const hostBox = box(host);
+    const hostHeight = hostBox?.height || 28;
+    if (hostHeight > titlebarBox.height) return null;
+    const hostWidth = Math.min(available, hostBox?.width || available);
+    const placementX = gap.left + (available - hostWidth) / 2;
+    const placementY = titlebarBox.y + (titlebarBox.height - hostHeight) / 2;
+    host.style.setProperty("--usage-left", `${Math.round(placementX)}px`);
+    host.style.setProperty("--usage-top", `${Math.round(placementY)}px`);
+    host.style.setProperty("--usage-popover-top", "calc(100% + 8px)");
+    host.style.setProperty("--usage-popover-bottom", "auto");
+    host.style.setProperty("--usage-popover-max-height", `${Math.max(80, window.innerHeight - placementY - hostHeight - 20)}px`);
+    const resetForecastVisible = host.dataset.resetForecast !== "false";
+    const apiColumnsVisible = host.dataset.apiColumns !== "false";
+    const columnWidths = [230, 230];
+    if (resetForecastVisible) columnWidths.push(160);
+    if (apiColumnsVisible) columnWidths.push(230, 170);
+    const columnCount = Math.max(columnWidths.length, Number.parseInt(host.dataset.columnCount, 10) || columnWidths.length);
+    while (columnWidths.length < columnCount) columnWidths.push(230);
+    const renderedPopoverWidth = box(host.shadowRoot?.querySelector(".usage-popover"))?.width || 0;
+    const popoverWidth = Math.min(window.innerWidth - 24, Math.max(280, renderedPopoverWidth, columnWidths.reduce((total, width) => total + width, 0) + 40));
+    const popoverLeft = Math.max(12, Math.min(window.innerWidth - 12 - popoverWidth, placementX + hostWidth / 2 - popoverWidth / 2));
+    host.style.setProperty("--usage-column-widths", columnWidths.map((width) => `${width}px`).join(" "));
+    host.style.setProperty("--usage-popover-width", `${popoverWidth}px`);
+    host.style.setProperty("--usage-popover-shift", `${Math.round(popoverLeft - placementX)}px`);
+    host.dataset.placement = "top";
+    host.dataset.anchor = "titlebar";
+    host.dataset.compact = String(available < 210);
+    return { ok: true, reason: null, anchor: "titlebar", availableWidth: available, controlCount: occupied.length };
+  };
+
+  const configurePosition = (host, composer, hostId) => {
+    const topPosition = configureTitlebarPosition(host, hostId);
+    if (topPosition) return topPosition;
+    host.dataset.placement = "composer";
+    host.style.removeProperty("--usage-titlebar-height");
+    host.style.setProperty("--usage-popover-top", "auto");
+    host.style.setProperty("--usage-popover-bottom", "calc(100% + 8px)");
+    host.style.removeProperty("--usage-popover-max-height");
+    if (reservedComposer && reservedComposer.node !== composer) clearPlacement();
+    let composerBox = box(composer);
+    if (!composerBox) return { ok: false, reason: "composer-box-unavailable" };
+    const controls = [...composer.querySelectorAll(CONTROL_SELECTOR)]
+      .filter((node) => isVisible(node) && !node.closest(`#${hostId}`));
+    const approval = controls.find(isApprovalControl) || null;
+    const controlBoxes = controls.map((node) => ({ node, rect: box(node) })).filter((item) => item.rect);
+    const bottomCenter = controlBoxes.reduce((maximum, item) => Math.max(maximum, item.rect.y + item.rect.height / 2), -Infinity);
+    const bottomRow = controlBoxes
+      .filter((item) => Math.abs(item.rect.y + item.rect.height / 2 - bottomCenter) <= 14)
+      .sort((left, right) => left.rect.x - right.rect.x);
+    const widestGap = bottomRow.slice(1).reduce((widest, right, index) => {
+      const left = bottomRow[index];
+      const gap = right.rect.x - left.rect.right;
+      return !widest || gap > widest.width ? { left, right, width: gap } : widest;
+    }, null);
+    let anchor = approval || widestGap?.left.node || bottomRow[0]?.node || null;
+    let anchorBox = box(anchor);
+    let rowCenter = anchorBox ? anchorBox.y + anchorBox.height / 2 : composerBox.bottom - 22;
+    const controlsToRight = controls
+      .map((node) => ({ node, rect: box(node) }))
+      .filter(({ node, rect }) => rect && node !== anchor && rect.x >= (anchorBox?.right ?? composerBox.x)
+        && Math.abs(rect.y + rect.height / 2 - rowCenter) <= 14);
+    let placementX = (anchorBox?.right ?? composerBox.x + 12) + 8;
+    let rightBoundary = approval || !widestGap
+      ? controlsToRight.reduce((minimum, value) => Math.min(minimum, value.rect.x), composerBox.right)
+      : widestGap.right.rect.x;
+    let shiftedRight = false;
+    if (approval && rightBoundary - placementX - 8 < 104) {
+      // Goal/plan chips can occupy the gap immediately after permissions.
+      // Keep the same toolbar row and move beyond intervening controls instead
+      // of hiding while a usable gap still exists to the right.
+      const row = controlBoxes.filter(item => Math.abs(item.rect.y + item.rect.height / 2 - rowCenter) <= 14)
+        .sort((left, right) => left.rect.x - right.rect.x);
+      for (let index = 0; index < row.length; index += 1) {
+        const left = row[index];
+        if (left.rect.right < (anchorBox?.right ?? composerBox.x)) continue;
+        const boundary = row.slice(index + 1).reduce((minimum, item) => Math.min(minimum, item.rect.x), composerBox.right);
+        if (boundary - left.rect.right - 16 < 104) continue;
+        anchor = left.node;
+        anchorBox = left.rect;
+        placementX = left.rect.right + 8;
+        rightBoundary = boundary;
+        shiftedRight = true;
+        break;
+      }
+    }
+    let available = Math.max(0, Math.floor(rightBoundary - placementX - 8));
+    const hostHeight = box(host)?.height || 28;
+    // Question cards put an editable in the same row as the toolbar buttons.
+    // That apparent button gap is input space, not a safe monitor location.
+    const inlineInput = [...composer.querySelectorAll(EDITABLE_SELECTOR)].map(box)
+      .some((rect) => rect && rect.width > 0 && rect.height > 0
+        && rect.y < rowCenter + hostHeight / 2 && rect.bottom > rowCenter - hostHeight / 2
+        && rect.x < rightBoundary && rect.right > placementX);
+    if (inlineInput) {
+      if (!reservedComposer) {
+        reservedComposer = { node: composer,
+          value: composer.style.getPropertyValue("padding-bottom"),
+          priority: composer.style.getPropertyPriority("padding-bottom"),
+          base: Number.parseFloat(getComputedStyle(composer).paddingBottom) || 0 };
+      }
+      composer.style.setProperty("padding-bottom", `${reservedComposer.base + hostHeight + 8}px`, "important");
+      composerBox = box(composer);
+      placementX = composerBox.x + 12;
+      available = Math.max(0, Math.floor(composerBox.width - 24));
+      rowCenter = composerBox.bottom - reservedComposer.base - 4 - hostHeight / 2;
+    } else if (reservedComposer) {
+      clearPlacement();
+      return configurePosition(host, composer, hostId);
+    }
+    const reference = anchor || controls.find((node) => /(?:\b5\.\d|model|极高|high)/i.test(controlText(node))) || controls[0];
+    if (reference) {
+      const referenceStyle = getComputedStyle(reference);
+      host.style.setProperty("--usage-color", referenceStyle.color);
+      if (referenceStyle.fontSize) host.style.setProperty("--usage-font-size", referenceStyle.fontSize);
+      const surface = getComputedStyle(composer).backgroundColor;
+      host.style.setProperty("--usage-surface", surface && surface !== "rgba(0, 0, 0, 0)" ? surface : "rgba(255, 255, 255, .96)");
+    }
+    const placementY = Math.max(8, Math.min(window.innerHeight - hostHeight - 8, rowCenter - hostHeight / 2));
+    host.style.setProperty("--usage-left", `${Math.round(placementX)}px`);
+    host.style.setProperty("--usage-top", `${Math.round(placementY)}px`);
+    host.style.setProperty("--usage-max-width", `${available}px`);
+    const apiColumnsVisible = host.dataset.apiColumns !== "false";
+    const resetForecastVisible = host.dataset.resetForecast !== "false";
+    const baseColumnCount = (apiColumnsVisible ? 4 : 2) + (resetForecastVisible ? 1 : 0);
+    const columnCount = Math.max(baseColumnCount, Number.parseInt(host.dataset.columnCount, 10) || baseColumnCount);
+    const columnWidths = [230, 230];
+    if (resetForecastVisible) columnWidths.push(160);
+    if (apiColumnsVisible) columnWidths.push(230, 170);
+    while (columnWidths.length < columnCount) columnWidths.push(230);
+    const columnWidthTotal = columnWidths.reduce((total, width) => total + width, 0);
+    const renderedPopoverWidth = box(host.shadowRoot?.querySelector(".usage-popover"))?.width || 0;
+    const popoverWidth = Math.max(280, renderedPopoverWidth, columnWidthTotal + 40);
+    const desiredLeftExtension = resetForecastVisible ? -160 : 0;
+    const rightEdgeShift = window.innerWidth - 12 - placementX - popoverWidth;
+    const popoverShift = Math.min(desiredLeftExtension, rightEdgeShift) - 16;
+    host.style.setProperty("--usage-column-widths", columnWidths.map((width) => `${width}px`).join(" "));
+    host.style.setProperty("--usage-popover-width", `${popoverWidth}px`);
+    host.style.setProperty("--usage-popover-shift", `${popoverShift}px`);
+    host.dataset.anchor = inlineInput ? "reserved-composer-row"
+      : shiftedRight ? "right-control-gap" : approval ? "approval" : widestGap ? "control-gap" : anchor ? "control" : "composer-left";
+    host.dataset.compact = String(available < 210);
+    host.hidden = available < 104;
+    return {
+      ok: available >= 104,
+      reason: available >= 104 ? null : "insufficient-composer-width",
+      anchor: host.dataset.anchor,
+      availableWidth: available,
+      controlCount: controls.length,
+    };
+  };
+
+  registry.placement = Object.freeze({ box, findPlacement, configurePosition, clearPlacement });
+})();
