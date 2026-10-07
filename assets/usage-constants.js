@@ -1,8 +1,8 @@
 (() => {
   const registry = window.__CODEX_USAGE_MONITOR_MODULES__ ||= {};
   registry.constants = Object.freeze({
-    VERSION: "1.1.0",
-    PRODUCT_NAME: "SEAN Context Monitor",
+    VERSION: "1.2.0",
+    PRODUCT_NAME: "CtxMeter",
     STATE_KEY: "__CODEX_USAGE_MONITOR_STATE__",
     USAGE_KEY: "__CODEX_USAGE_MONITOR__",
     HOST_ID: "codex-usage-monitor",

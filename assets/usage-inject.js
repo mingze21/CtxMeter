@@ -1,7 +1,7 @@
 (() => {
   const modules = window.__CODEX_USAGE_MONITOR_MODULES__;
   if (!modules?.constants || !modules?.i18n || !modules?.placement) {
-    throw new Error("SEAN Context Monitor modules are incomplete.");
+    throw new Error("CtxMeter modules are incomplete.");
   }
   const {
     VERSION, PRODUCT_NAME, STATE_KEY, USAGE_KEY, HOST_ID, SETTINGS_KEY, PREVIOUS_SETTINGS_KEY,
@@ -1499,7 +1499,7 @@
           item.classList.add("usage-summary-context");
           const mark = document.createElement("span");
           mark.className = "usage-context-mark";
-          mark.textContent = "S";
+          mark.textContent = "M";
           mark.setAttribute("aria-hidden", "true");
           const meter = document.createElement("span");
           meter.className = "usage-context-meter";
