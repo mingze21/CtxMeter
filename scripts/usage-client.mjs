@@ -2906,7 +2906,7 @@ class AppServerRpc {
     });
 
     await this.request("initialize", {
-      clientInfo: { name: "ctxmeter", title: "CtxMeter", version: "1.2.0" },
+      clientInfo: { name: "ctxmeter", title: "CtxMeter", version: "1.2.1" },
       capabilities: { optOutNotificationMethods: [] },
     });
     this.notify("initialized");
