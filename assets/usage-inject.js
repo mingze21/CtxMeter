@@ -497,6 +497,7 @@
       <span class="usage-refresh-ring" aria-hidden="true" hidden></span>
       <span class="usage-backend-warning" hidden></span>
       <span class="usage-summary-items"><span class="usage-summary-item">Usage --</span></span>
+      <span class="usage-summary-overflow" aria-hidden="true" hidden>⋯</span>
     </div>
     <div class="usage-popover" role="dialog" aria-label="Usage display settings" hidden>
       <div class="usage-backend-notice" role="status" aria-atomic="true" hidden></div>
@@ -535,7 +536,7 @@
       gap: 0;
       min-width: 0;
       max-width: 100%;
-      height: 28px;
+      height: var(--usage-host-height, 28px);
       max-height: var(--usage-titlebar-height, none);
       padding: 0 9px;
       border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
@@ -553,7 +554,13 @@
     }
     .usage-summary, .usage-summary *, .usage-popover, .usage-popover * { -webkit-app-region: no-drag; }
     :host([data-placement="top"]) .usage-summary:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; }
+    :host([data-placement="top"]) .usage-summary { padding-block: var(--usage-titlebar-padding, 2px); }
     :host([data-placement="top"]) .usage-popover { max-width: calc(100vw - 24px); overflow-x: auto; }
+    :host([data-placement="top"]) .usage-summary-items { flex: 0 0 auto; width: max-content; max-width: none; overflow: visible; }
+    :host([data-placement="top"]) .usage-summary-item { flex: 0 0 auto; }
+    :host([data-placement="top"]) .usage-summary-item[data-summary-first-visible] { padding-left: 0; }
+    :host([data-placement="top"]) .usage-summary-item[data-summary-first-visible]::before { display: none; }
+    .usage-summary-overflow { flex: 0 0 auto; margin-left: 6px; font-size: 16px; font-weight: 700; line-height: 1; }
     .usage-summary-items { display: flex; align-items: center; min-width: 0; max-width: 100%; height: 100%; gap: 0; overflow: hidden; line-height: 1; }
     .usage-summary-item { position: relative; display: inline-flex; align-items: center; min-width: 0; height: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
     .usage-summary-auto-resume { gap: 5px; overflow: visible; }
@@ -651,6 +658,8 @@
     :host([data-density="dense"]) .usage-refresh-ring { width: 12px; height: 12px; margin-right: 4px; flex-basis: 12px; }
     :host([data-density="dense"]) .usage-summary-item + .usage-summary-item { padding-left: 7px; }
     :host([data-density="dense"]) .usage-summary-item + .usage-summary-item::before { left: 3px; height: 13px; }
+    :host([data-placement="top"][data-density="dense"]) .usage-summary-context { gap: 4px; }
+    :host([data-placement="top"][data-density="dense"]) .usage-summary-metric { gap: 3px; }
     :host([data-density="packed"]) .usage-summary { height: 30px; padding: 2px 5px; }
     :host([data-density="packed"]) .usage-refresh-ring { width: 11px; height: 11px; margin-right: 3px; flex-basis: 11px; }
     :host([data-density="packed"]) .usage-summary-items { display: grid; grid-template-rows: repeat(2, minmax(0, 1fr)); grid-auto-flow: column; align-items: stretch; line-height: 1; }
@@ -1066,6 +1075,66 @@
     ? MAX_MINIMAL_SELECTED_METRICS
     : MAX_SELECTED_METRICS;
 
+  const summaryDensity = (host, settings, count) => {
+    if (host.dataset.placement === "top") return "normal";
+    const availableWidth = Number.parseInt(host.style.getPropertyValue("--usage-max-width"), 10) || 280;
+    return settings.minimalMode ? count >= 9 ? "packed" : "normal"
+      : count >= 7 || (count >= 5 && availableWidth < 280) ? "packed" : count >= 5 ? "dense" : "normal";
+  };
+
+  const fitSummary = (host) => {
+    const shadow = host.shadowRoot;
+    const summary = shadow?.querySelector(".usage-summary");
+    if (!summary) return { width: 0, fits: true };
+    const items = [...shadow.querySelectorAll(".usage-summary-item")];
+    const overflow = shadow.querySelector(".usage-summary-overflow");
+    const settings = loadSettings();
+    const t = createTranslator(settings.englishUi ? "en" : "zh");
+    const count = items.filter((item) => item.dataset.metric).length;
+    items.forEach((item) => { item.hidden = false; });
+    if (overflow) overflow.hidden = true;
+    host.dataset.density = summaryDensity(host, settings, count);
+    const styleWidth = (style, properties) => properties.reduce((total, name) => total + (Number.parseFloat(style[name]) || 0), 0);
+    const measure = () => {
+      const firstVisible = items.find((item) => !item.hidden);
+      items.forEach((item) => item.toggleAttribute("data-summary-first-visible", item === firstVisible));
+      const style = getComputedStyle(summary);
+      const edges = styleWidth(style, ["paddingLeft", "paddingRight", "borderLeftWidth", "borderRightWidth"]);
+      const extra = [".usage-refresh-ring", ".usage-backend-warning", ".usage-summary-overflow"]
+        .map((selector) => shadow.querySelector(selector)).filter((node) => node && !node.hidden)
+        .reduce((total, node) => total + node.getBoundingClientRect().width
+          + styleWidth(getComputedStyle(node), ["marginLeft", "marginRight"]), 0);
+      return Math.ceil(edges + extra + items.filter((item) => !item.hidden)
+        .reduce((total, item) => total + item.getBoundingClientRect().width, 0));
+    };
+    const available = Number.parseFloat(host.style.getPropertyValue("--usage-max-width")) || 280;
+    let width = measure();
+    if (host.dataset.placement === "top" && host.dataset.backend !== "disconnected") {
+      if (width > available) {
+        host.dataset.density = "dense";
+        width = measure();
+      }
+      // Keep the user's selection/order intact. Only presentation changes;
+      // the full set remains in the same details popover and returns on resize.
+      const protectedItem = items.find((item) => item.dataset.metric === "contextUsage") || items[0];
+      for (let index = items.length - 1; index >= 0 && width > available; index -= 1) {
+        if (items[index] === protectedItem) continue;
+        items[index].hidden = true;
+        if (overflow) overflow.hidden = false;
+        width = measure();
+      }
+    }
+    const hidden = items.filter((item) => item.hidden && item.dataset.metric).length;
+    const visible = count - hidden;
+    host.dataset.overflowCount = String(hidden);
+    host.dataset.visibleCount = String(visible);
+    if (overflow) overflow.title = hidden ? t("foldedItems", { count: hidden }) : "";
+    summary.title = hidden ? t("foldedItems", { count: hidden }) : "";
+    summary.setAttribute("aria-label", host.dataset.backend === "disconnected" ? t("backendRecovery")
+      : hidden ? t("displayedItemsOverflow", { count: visible, hidden }) : t("displayedItems", { count: visible }));
+    return { width, fits: width <= available };
+  };
+
   const executionTimeDisplay = (metric, t, now = Date.now()) => {
     if (!finiteNumber(metric?.durationMs)) return "--";
     const sampledAt = Date.parse(metric.sampledAt);
@@ -1479,11 +1548,7 @@
       settingsChanged = true;
     }
     if (settingsChanged) saveSettings(settings);
-    const availableWidth = Number.parseInt(host.style.getPropertyValue("--usage-max-width"), 10) || 280;
-    host.dataset.density = settings.minimalMode
-      ? selected.length >= 9 ? "packed" : "normal"
-      : selected.length >= 7 || (selected.length >= 5 && availableWidth < 280)
-        ? "packed" : selected.length >= 5 ? "dense" : "normal";
+    host.dataset.density = summaryDensity(host, settings, selected.length);
     host.dataset.minimal = String(settings.minimalMode);
     host.dataset.summaryStyle = settings.summaryStyle;
     const shadow = host.shadowRoot;
@@ -1818,12 +1883,8 @@
     }
     updateCountdowns(host, usage);
     host.dataset.rendered = "true";
-    if (host.dataset.open === "true") {
-      requestAnimationFrame(() => {
-        const state = window[STATE_KEY];
-        if (state?.host === host) state.ensure();
-      });
-    }
+    const state = window[STATE_KEY];
+    if (state?.host === host) state.ensure();
   };
 
   let preferredComposer = null;
@@ -1833,6 +1894,7 @@
     const placement = findPlacement(HOST_ID, preferredComposer);
     if (!placement.composer) {
       clearPlacement();
+      syncResizeTargets([]);
       document.getElementById(HOST_ID)?.remove();
       if (state) {
         state.host = null;
@@ -2084,7 +2146,8 @@
     host.dataset.apiColumns = String(currentSettings.showApiColumns);
     host.dataset.resetForecast = String(currentSettings.showResetForecast);
     host.dataset.columnCount = String(2 + (currentSettings.showApiColumns ? 2 : 0) + (currentSettings.showResetForecast ? 1 : 0));
-    const position = configurePosition(host, placement.composer, HOST_ID);
+    const position = configurePosition(host, placement.composer, HOST_ID, fitSummary);
+    syncResizeTargets([host, host.shadowRoot.querySelector(".usage-summary-items"), ...(position.observedNodes || [])]);
     host.dataset.placementStrategy = placement.strategy;
     host.dataset.status = position.ok ? "ready" : "degraded";
     if (state) {
@@ -2111,6 +2174,20 @@
     }, PLACEMENT_DEBOUNCE_MS);
   };
   const observer = new MutationObserver(scheduleEnsure);
+  const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(scheduleEnsure) : null;
+  const resizeTargets = new Set();
+  const syncResizeTargets = (nodes) => {
+    if (!resizeObserver) return;
+    const next = new Set(nodes.filter((node) => node?.isConnected));
+    for (const node of resizeTargets) if (!next.has(node)) {
+      resizeObserver.unobserve(node);
+      resizeTargets.delete(node);
+    }
+    for (const node of next) if (!resizeTargets.has(node)) {
+      resizeObserver.observe(node);
+      resizeTargets.add(node);
+    }
+  };
   const observerTarget = document.documentElement || document;
   observer.observe(observerTarget, {
     childList: true, subtree: true, attributes: true,
@@ -2146,6 +2223,7 @@
 
   window[STATE_KEY] = {
     observer,
+    resizeObserver,
     timer,
     countdownTimer,
     scheduler,
@@ -2198,6 +2276,8 @@
         if (draft && typeof draft === "object") { draft.token = ""; draft.apiKey = ""; }
       }
       observer.disconnect();
+      resizeObserver?.disconnect();
+      resizeTargets.clear();
       clearInterval(timer);
       clearInterval(countdownTimer);
       if (scheduler.timeout) clearTimeout(scheduler.timeout);

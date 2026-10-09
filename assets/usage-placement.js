@@ -117,12 +117,12 @@
     return { ...match, reason: null, editableCount: editables.length, composerCount: composers.length };
   };
 
-  const configureTitlebarPosition = (host, hostId) => {
+  const configureTitlebarPosition = (host, hostId, fitSummary) => {
     const titlebar = [...document.querySelectorAll('[class*="ApplicationMenuTopBar"], [data-testid="window-titlebar"], [data-testid="titlebar"], header.draggable')]
       .find((node) => {
         const rect = box(node);
         return isVisible(node) && getComputedStyle(node).visibility !== "hidden"
-          && rect.y >= 0 && rect.y <= 8 && rect.height >= 28 && rect.height <= 64 && rect.width >= 240;
+          && rect.y >= 0 && rect.y <= 8 && rect.height >= 28 && rect.height <= 96 && rect.width >= 240;
       });
     if (!titlebar) return null;
     const titlebarBox = box(titlebar);
@@ -139,8 +139,9 @@
         right = Math.min(right, area.x + area.width - 8);
       }
     } catch {}
-    const occupied = [...titlebar.querySelectorAll('button, [role="button"], a, input, select, [tabindex], .no-drag')]
-      .filter((node) => !node.closest(`#${hostId}`) && isVisible(node))
+    const controls = [...titlebar.querySelectorAll('button, [role="button"], a, input, select, [tabindex], .no-drag')]
+      .filter((node) => !node.closest(`#${hostId}`) && isVisible(node));
+    const occupied = controls
       .map(box)
       .filter((rect) => rect.y < titlebarBox.bottom && rect.bottom > titlebarBox.y && rect.right > left && rect.x < right)
       .sort((a, b) => a.x - b.x);
@@ -162,7 +163,13 @@
     if (referenceStyle.fontSize) host.style.setProperty("--usage-font-size", referenceStyle.fontSize);
     host.style.setProperty("--usage-max-width", `${available}px`);
     host.style.setProperty("--usage-titlebar-height", `${Math.floor(titlebarBox.height)}px`);
+    host.style.setProperty("--usage-host-height", `${Math.floor(titlebarBox.height)}px`);
+    // Keep breathing room inside taller bars without clipping two-line
+    // metrics when the native bar is only 28px high.
+    host.style.setProperty("--usage-titlebar-padding", titlebarBox.height >= 32 ? "2px" : "0px");
+    host.dataset.placement = "top";
     host.hidden = false;
+    if (fitSummary && !fitSummary(host).fits) return null;
     const hostBox = box(host);
     const hostHeight = hostBox?.height || 28;
     if (hostHeight > titlebarBox.height) return null;
@@ -187,17 +194,20 @@
     host.style.setProperty("--usage-column-widths", columnWidths.map((width) => `${width}px`).join(" "));
     host.style.setProperty("--usage-popover-width", `${popoverWidth}px`);
     host.style.setProperty("--usage-popover-shift", `${Math.round(popoverLeft - placementX)}px`);
-    host.dataset.placement = "top";
     host.dataset.anchor = "titlebar";
     host.dataset.compact = String(available < 210);
-    return { ok: true, reason: null, anchor: "titlebar", availableWidth: available, controlCount: occupied.length };
+    return { ok: true, reason: null, anchor: "titlebar", availableWidth: available, controlCount: occupied.length,
+      observedNodes: [titlebar, ...controls] };
   };
 
-  const configurePosition = (host, composer, hostId) => {
-    const topPosition = configureTitlebarPosition(host, hostId);
+  const configurePosition = (host, composer, hostId, fitSummary = null) => {
+    const topPosition = configureTitlebarPosition(host, hostId, fitSummary);
     if (topPosition) return topPosition;
     host.dataset.placement = "composer";
     host.style.removeProperty("--usage-titlebar-height");
+    host.style.removeProperty("--usage-host-height");
+    host.style.removeProperty("--usage-titlebar-padding");
+    if (fitSummary) fitSummary(host);
     host.style.setProperty("--usage-popover-top", "auto");
     host.style.setProperty("--usage-popover-bottom", "calc(100% + 8px)");
     host.style.removeProperty("--usage-popover-max-height");
@@ -249,6 +259,8 @@
       }
     }
     let available = Math.max(0, Math.floor(rightBoundary - placementX - 8));
+    host.style.setProperty("--usage-max-width", `${available}px`);
+    if (fitSummary) fitSummary(host);
     const hostHeight = box(host)?.height || 28;
     // Question cards put an editable in the same row as the toolbar buttons.
     // That apparent button gap is input space, not a safe monitor location.
@@ -270,7 +282,7 @@
       rowCenter = composerBox.bottom - reservedComposer.base - 4 - hostHeight / 2;
     } else if (reservedComposer) {
       clearPlacement();
-      return configurePosition(host, composer, hostId);
+      return configurePosition(host, composer, hostId, fitSummary);
     }
     const reference = anchor || controls.find((node) => /(?:\b5\.\d|model|极高|high)/i.test(controlText(node))) || controls[0];
     if (reference) {
@@ -311,6 +323,7 @@
       anchor: host.dataset.anchor,
       availableWidth: available,
       controlCount: controls.length,
+      observedNodes: [composer, ...controls],
     };
   };
 

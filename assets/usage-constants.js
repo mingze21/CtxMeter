@@ -1,7 +1,7 @@
 (() => {
   const registry = window.__CODEX_USAGE_MONITOR_MODULES__ ||= {};
   registry.constants = Object.freeze({
-    VERSION: "1.2.1",
+    VERSION: "1.3.0",
     PRODUCT_NAME: "CtxMeter",
     TOPBAR_MARK: "S",
     STATE_KEY: "__CODEX_USAGE_MONITOR_STATE__",
