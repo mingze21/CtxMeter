@@ -1186,7 +1186,7 @@ try {
     assert.equal(monitor.getSettings().contextReminders, true, "context reminders default on");
     host.shadowRoot.querySelector(".usage-summary").click();
     assert.equal(host.shadowRoot.querySelector(".usage-popover").hidden, false);
-    assert.ok(contextSummary().querySelector(".usage-context-mark svg path"), "the rounded product mark uses a compact vector icon");
+    assert.equal(contextSummary().querySelector(".usage-context-mark").textContent, "S", "the compact product mark defaults to S");
     assert.equal(contextSummary().querySelector(".usage-context-mark").getAttribute("aria-hidden"), "true");
     assert.ok(contextSummary().querySelector(".usage-context-meter"));
     assert.equal(contextSummary().querySelector(".usage-context-dot"), null, "compact meter replaces the leading dot");
