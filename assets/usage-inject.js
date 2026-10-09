@@ -4,7 +4,7 @@
     throw new Error("CtxMeter modules are incomplete.");
   }
   const {
-    VERSION, PRODUCT_NAME, STATE_KEY, USAGE_KEY, HOST_ID, SETTINGS_KEY, PREVIOUS_SETTINGS_KEY,
+    VERSION, PRODUCT_NAME, TOPBAR_MARK, STATE_KEY, USAGE_KEY, HOST_ID, SETTINGS_KEY, PREVIOUS_SETTINGS_KEY,
     PERSISTED_SETTINGS_KEY, SETTINGS_BINDING, CONFIGURATION_KEY, CONFIGURATION_BINDING,
     REFRESH_INTERVAL_MS, LAYOUT_FALLBACK_INTERVAL_MS, COUNTDOWN_INTERVAL_MS,
     PLACEMENT_DEBOUNCE_MS, MAX_SELECTED_METRICS,
@@ -562,7 +562,7 @@
     [data-context-level="save"] { --usage-context-color: #a16207; }
     [data-context-level="new-chat"] { --usage-context-color: #dc2626; }
     .usage-summary-context { gap: 6px; flex-shrink: 0; }
-    .usage-context-mark { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; line-height: 1; flex: 0 0 20px; }
+    .usage-context-mark { font-size: 20px; font-weight: 800; line-height: 1; letter-spacing: -1px; flex: 0 0 auto; }
     .usage-context-meter { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; width: 32px; flex: 0 0 32px; }
     .usage-context-track { display: block; width: 30px; height: 5px; border-radius: 3px; overflow: hidden; background: color-mix(in srgb, var(--usage-context-color) 20%, transparent); }
     .usage-context-fill { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--usage-context-color); }
@@ -1499,21 +1499,8 @@
           item.classList.add("usage-summary-context");
           const mark = document.createElement("span");
           mark.className = "usage-context-mark";
+          mark.textContent = TOPBAR_MARK;
           mark.setAttribute("aria-hidden", "true");
-          const markSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-          markSvg.setAttribute("viewBox", "0 0 24 24");
-          markSvg.setAttribute("width", "20");
-          markSvg.setAttribute("height", "20");
-          markSvg.setAttribute("focusable", "false");
-          const markPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
-          markPath.setAttribute("d", "M4 20V5.5Q4 3 5.4 5.2L11.1 16.1Q12 17.8 12.9 16.1L18.6 5.2Q20 3 20 5.5V20");
-          markPath.setAttribute("fill", "none");
-          markPath.setAttribute("stroke", "currentColor");
-          markPath.setAttribute("stroke-width", "4.5");
-          markPath.setAttribute("stroke-linecap", "round");
-          markPath.setAttribute("stroke-linejoin", "round");
-          markSvg.append(markPath);
-          mark.append(markSvg);
           const meter = document.createElement("span");
           meter.className = "usage-context-meter";
           const track = document.createElement("span");
