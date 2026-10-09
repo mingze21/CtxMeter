@@ -2,7 +2,7 @@
 
 <img src="docs/images/ctxmeter-icon.png" width="80" alt="CtxMeter 的 M 图标">
 
-Windows 版 Codex Desktop 的顶部上下文与用量监视器，默认使用 **S** 作为紧凑标识，桌面图标保留 **M**。产品版本 **1.2.1**，完整维护编号 **1.2.1+ctx.1**。提供三种可切换的顶部样式、上下文提醒及用量统计。
+Windows 版 Codex Desktop 的顶部上下文与用量监视器，默认使用 **S** 作为紧凑标识，桌面图标保留 **M**。产品版本 **1.3.0**，完整维护编号 **1.3.0+ctx.1**。提供自适应顶部布局、三种可切换的顶部样式、上下文提醒及用量统计。
 
 [下载最新安装包](https://github.com/mingze21/CtxMeter/releases/latest) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/mingze21/CtxMeter/issues)
 
@@ -14,7 +14,9 @@ Windows 版 Codex Desktop 的顶部上下文与用量监视器，默认使用 **
 
 以下为真实界面使用演示数据的截图，不包含用户实际账户或会话数据。顶部示例采用“数字胶囊”样式。
 
-![顶部监视栏：数字胶囊样式](docs/images/topbar.jpg)
+![顶部监视栏：高度贴合标题栏，长度随内容调整](docs/images/topbar.jpg)
+
+![窄窗口：自动折叠次要指标，保留上下文和提醒](docs/images/topbar-narrow.jpg)
 
 ![展开面板：上下文估算、订阅额度与重置概率](docs/images/panel.jpg)
 
@@ -47,7 +49,7 @@ Windows 版 Codex Desktop 的顶部上下文与用量监视器，默认使用 **
 
 需要 Windows 10/11、Codex Desktop、Node.js 22 或更高版本，以及 PowerShell。建议使用 PowerShell 7。
 
-1. 从 [v1.2.1 Releases](https://github.com/mingze21/CtxMeter/releases/tag/v1.2.1) 下载 `ctxmeter-1.2.1.zip`（安装包，而非 GitHub 自动生成的 Source code），用同页 `.sha256` 文件核验后解压，阅读 [AGENTS.md](AGENTS.md)。
+1. 从 [v1.3.0 Releases](https://github.com/mingze21/CtxMeter/releases/tag/v1.3.0) 下载 `ctxmeter-1.3.0.zip`（安装包，而非 GitHub 自动生成的 Source code），用同页 `.sha256` 文件核验后解压，阅读 [AGENTS.md](AGENTS.md)。
 2. 在解压目录执行：
 
    ```powershell
@@ -65,10 +67,16 @@ Windows 版 Codex Desktop 的顶部上下文与用量监视器，默认使用 **
 默认程序目录：
 
 ```text
-%LOCALAPPDATA%\Programs\CtxMeter\1.2.1
+%LOCALAPPDATA%\Programs\CtxMeter\1.3.0
 ```
 
-安装器不会强制关闭或重启 Codex，也不会改动 WindowsApps、`app.asar`、登录文件、模型设置或原生 Codex 快捷方式。标题栏没有足够空间时，会回退到输入区域附近。
+安装器不会强制关闭或重启 Codex，也不会改动 WindowsApps、`app.asar`、登录文件、模型设置或原生 Codex 快捷方式。
+
+## 自适应顶部布局
+
+监视栏跟随标题栏实际高度调整位置，宽度按显示内容收拢，并为两侧按钮与菜单预留安全间距。缩窄窗口时，先压紧指标间距，再折叠次要指标，优先保留已选择的上下文进度与行动提示；点击省略标识可打开原有详细面板。
+
+重新扩大窗口后，折叠的指标会自动恢复，原有勾选与顺序保持不变。不同 Codex 版本的标题栏结构可能不同；可用空间过小、无法容纳核心内容时，监视栏会回退到输入区域附近。
 
 ## 顶部样式
 
@@ -114,7 +122,7 @@ TOPBAR_MARK: "S",
 
 本产品采用**手动更新**：不会检查、下载或安装原项目的发布包，避免覆盖定制功能。源码中保留的旧更新模块仅用于兼容性测试，监视器运行入口不加载它们；旧 `updateNotifications` 设置不会触发更新。
 
-完整维护编号及直接修改基线记录在 `BUILD-INFO.json`；本次 `1.2.1+ctx.1` 的顶部样式直接继承自用 S 版 `1.2.0+ctx.local.1`，该版基于上一公开版 `1.2.0+ctx.1`。本次将顶部 S 统一为公开默认值，增加字母修改入口与说明，保留 CtxMeter 名称、M 桌面图标、已有功能和配置兼容。历史维护编号保留原样，用于追溯继承关系。不要用版本号大小判断不同产品分支的新旧，也不要用原项目更新包覆盖本产品。
+完整维护编号及直接修改基线记录在 `BUILD-INFO.json`；本次 `1.3.0+ctx.1` 直接基于上一公开版 `1.2.1+ctx.1`，增加自适应顶部布局与窄窗口指标折叠，保留顶部 S 默认值、字母修改入口、CtxMeter 名称、M 桌面图标、已有功能和配置兼容。历史维护编号保留原样，用于追溯继承关系。不要用版本号大小判断不同产品分支的新旧，也不要用原项目更新包覆盖本产品。
 
 ## 开发、测试与打包
 
@@ -124,6 +132,6 @@ pwsh -NoProfile -File .\tests\run-tests.ps1
 pwsh -NoProfile -File .\scripts\build-release.ps1
 ```
 
-打包输出 `dist\ctxmeter-1.2.1.zip`。仅包含清单允许的源码、图标和文档，不包含用户凭据、运行日志、Node.js 或 Codex 二进制文件。
+打包输出 `dist\ctxmeter-1.3.0.zip`。仅包含清单允许的源码、图标和文档，不包含用户凭据、运行日志、Node.js 或 Codex 二进制文件。
 
 需要停止监视器并移除当前页面显示时，执行 `scripts\restore-monitor.ps1`；该命令不终止 Codex。故障排查和不重启 Codex 的后台替换方式见 [故障排查指南](docs/troubleshooting.md)。

@@ -2,12 +2,13 @@
 
 CtxMeter is an independently maintained context and usage monitor for Codex Desktop.
 It uses S as its default compact visual mark and retains the M desktop icon.
-The direct modification baseline for product version 1.2.1 (maintenance identifier
-1.2.1+ctx.1) is the personal S build 1.2.0+ctx.local.1, which inherited the previous
-public build 1.2.0+ctx.1. This revision makes the S mark the public default and
-documents letter customization while preserving the CtxMeter identity, existing
-functionality and settings compatibility. Historical maintenance identifiers
-remain unchanged. The previous public build inherited 1.1.0+sean.2,
+The direct modification baseline for product version 1.3.0 (maintenance identifier
+1.3.0+ctx.1) is the previous public build 1.2.1+ctx.1. This revision adds a responsive
+topbar layout and folds secondary metrics when space is limited, while preserving
+letter customization, the CtxMeter identity, existing functionality and settings
+compatibility. Historical maintenance identifiers remain unchanged.
+Build 1.2.1+ctx.1 inherited the personal S build 1.2.0+ctx.local.1, which inherited
+public build 1.2.0+ctx.1. The latter inherited 1.1.0+sean.2,
 1.1.0+sean.1, 1.0.0+sean.2, 1.0.0+sean.1,
 3.1.7+sean.context.1, 3.1.7+sean.topbar.1 and the following MIT-licensed upstream release:
 
