@@ -59,7 +59,8 @@ const { window } = dom;
 window.Element.prototype.getBoundingClientRect = function getBoundingClientRect() {
   const value = (() => {
     if (this.id === "composer-wrapper" || this.matches('.composer-surface-chrome, [class*="ComposerLayoutRoot"]')) return { x: 100, y: 100, width: 700, height: 100 };
-    if (this.id === "codex-usage-monitor") return { x: 234, y: 164, width: 380, height: 28 };
+    if (this.id === "codex-usage-monitor") return { x: 234, y: 164, width: 380,
+      height: Number.parseFloat(this.style.getPropertyValue("--usage-host-height")) || 28 };
     if (this.matches('[contenteditable="true"]')) return { x: 112, y: 112, width: 676, height: 44 };
     const text = `${this.getAttribute?.("aria-label") || ""} ${this.textContent || ""}`;
     if (/添加/.test(text)) return { x: 108, y: 164, width: 28, height: 28 };
@@ -872,7 +873,8 @@ try {
   const titlebarMenu = titlebar.firstElementChild;
   const titlebarControls = titlebar.lastElementChild;
   const rect = (x, y, width, height) => ({ x, y, width, height, right: x + width, bottom: y + height });
-  titlebar.getBoundingClientRect = () => rect(0, 0, window.innerWidth, 48);
+  let titlebarHeight = 48;
+  titlebar.getBoundingClientRect = () => rect(0, 0, window.innerWidth, titlebarHeight);
   titlebarMenu.getBoundingClientRect = () => rect(12, 8, 44, 32);
   titlebarControls.getBoundingClientRect = () => rect(window.innerWidth - 144, 0, 144, 48);
   window.document.body.prepend(titlebar);
@@ -894,7 +896,8 @@ try {
       Number.parseFloat(host.style.getPropertyValue("--usage-max-width")));
     assert.ok(left >= leftBoundary, "titlebar menu remains unobstructed");
     assert.ok(left + summaryWidth <= rightBoundary, "titlebar window controls remain unobstructed");
-    assert.ok(top >= 0 && top + 28 <= 48, "summary fits entirely inside the titlebar");
+    const summaryHeight = Number.parseFloat(host.style.getPropertyValue("--usage-host-height")) || host.getBoundingClientRect().height;
+    assert.ok(top >= 0 && top + summaryHeight <= titlebarHeight, "summary fits entirely inside the titlebar");
     assert.equal(host.style.getPropertyValue("--usage-popover-top"), "calc(100% + 8px)");
     assert.equal(host.style.getPropertyValue("--usage-popover-bottom"), "auto");
     assert.equal(topbarComposer.style.paddingBottom, "6px", "topbar placement must not reserve a composer row");
@@ -924,6 +927,14 @@ try {
     assert.ok(left + width <= window.innerWidth - 12, "popover stays within the right viewport edge");
   };
   assertPopoverInViewport();
+
+  titlebarHeight = 64;
+  window.__CODEX_USAGE_MONITOR_STATE__.ensure();
+  assertTitlebarPlacement();
+  assert.equal(host.style.getPropertyValue("--usage-host-height"), "64px", "a taller titlebar increases the monitor height");
+  titlebarHeight = 48;
+  window.__CODEX_USAGE_MONITOR_STATE__.ensure();
+  assert.equal(host.style.getPropertyValue("--usage-host-height"), "48px", "restoring titlebar height restores the monitor height");
   window.innerWidth = 800;
   window.dispatchEvent(new window.Event("resize"));
   await new Promise((resolve) => setTimeout(resolve, 250));
@@ -1476,6 +1487,173 @@ try {
       assert.equal(monitor.getSettings().summaryStyle, "clear", "malformed saved preferences safely use the default");
       assert.equal(host.dataset.summaryStyle, "clear");
       assert.equal(summaryStyleSelect().value, "clear");
+    }
+
+    // JSDOM does not lay out shadow DOM. Supply stable measured widths for the
+    // real rendered entries so responsive fitting is exercised with unequal
+    // values, rather than with an arbitrary selected-item count.
+    const originalElementBox = window.Element.prototype.getBoundingClientRect;
+    const originalResizeObserver = Object.getOwnPropertyDescriptor(window, "ResizeObserver");
+    const resizeObservers = [];
+    window.ResizeObserver = class TestResizeObserver {
+      constructor(callback) { this.callback = callback; this.nodes = new Set(); this.disconnected = false; resizeObservers.push(this); }
+      observe(node) { this.nodes.add(node); }
+      unobserve(node) { this.nodes.delete(node); }
+      disconnect() { this.nodes.clear(); this.disconnected = true; }
+    };
+    const responsiveWidth = window.innerWidth;
+    const responsiveBar = window.document.createElement("header");
+    responsiveBar.setAttribute("data-testid", "window-titlebar");
+    responsiveBar.innerHTML = '<button aria-label="Application menu"></button><button aria-label="Window controls"></button>';
+    let responsiveHeight = 48;
+    responsiveBar.getBoundingClientRect = () => rect(0, 0, window.innerWidth, responsiveHeight);
+    responsiveBar.firstElementChild.getBoundingClientRect = () => rect(0, 0, 220, responsiveHeight);
+    responsiveBar.lastElementChild.getBoundingClientRect = () => rect(window.innerWidth - 144, 0, 144, responsiveHeight);
+    const ownerHost = (element) => element.id === "codex-usage-monitor" ? element : element.getRootNode()?.host;
+    const entryWidth = (element) => {
+      if (element.hidden) return 0;
+      const owner = ownerHost(element);
+      const compact = owner?.dataset.density === "dense";
+      const minimal = owner?.dataset.minimal === "true";
+      const style = owner?.dataset.summaryStyle;
+      const width = element.dataset.metric === "contextUsage" ? 150
+        : element.dataset.metric === "primaryReset" ? 144 : 94;
+      return width + (style === "capsule" ? 10 : 0) - (compact ? 8 : 0) - (minimal ? 20 : 0);
+    };
+    const naturalSummaryWidth = (owner) => {
+      const entries = [...owner.shadowRoot.querySelectorAll(".usage-summary-item")].filter((item) => !item.hidden);
+      const overflow = owner.shadowRoot.querySelector(".usage-summary-overflow");
+      const refresh = owner.shadowRoot.querySelector(".usage-refresh-ring");
+      return entries.reduce((width, item) => width + entryWidth(item), 0)
+        + (overflow && !overflow.hidden ? 20 : 0) + (refresh && !refresh.hidden ? 13 : 0);
+    };
+    window.Element.prototype.getBoundingClientRect = function responsiveBox() {
+      const owner = ownerHost(this);
+      if (owner?.id === "codex-usage-monitor") {
+        const height = Number.parseFloat(owner.style.getPropertyValue("--usage-host-height")) || 28;
+        if (this.matches(".usage-summary-item")) return rect(0, 0, entryWidth(this), height);
+        if (this.matches(".usage-refresh-ring")) return rect(0, 0, 13, 13);
+        if (this.matches(".usage-summary-overflow")) return rect(0, 0, this.hidden ? 0 : 20, height);
+        if (this.matches(".usage-summary-items")) return rect(0, 0,
+          [...this.children].reduce((width, item) => width + entryWidth(item), 0), height);
+        if (this.id === "codex-usage-monitor" || this.matches(".usage-summary")) {
+          const width = Math.min(naturalSummaryWidth(owner), Number.parseFloat(owner.style.getPropertyValue("--usage-max-width")) || Infinity);
+          const left = Number.parseFloat(owner.style.getPropertyValue("--usage-left")) || 0;
+          const top = Number.parseFloat(owner.style.getPropertyValue("--usage-top")) || 0;
+          return rect(left, top, width, height);
+        }
+      }
+      return originalElementBox.call(this);
+    };
+    const responsiveSettings = {
+      ...styleBaseSettings,
+      // Context is deliberately last: its importance must not depend on order.
+      metricOrder: ["session:contextCompactions", "official:secondaryRemaining", "official:primaryReset",
+        "reset-forecast:probability48h", "session:contextUsage"],
+    };
+    const allEntries = () => [...host.shadowRoot.querySelectorAll(".usage-summary-item")];
+    const visibleEntries = () => allEntries().filter((item) => !item.hidden);
+    const assertResponsiveBounds = () => {
+      const position = host.getBoundingClientRect();
+      assert.equal(host.dataset.anchor, "titlebar");
+      assert.ok(position.x >= 228, "adaptive summary keeps a safe gap after the menu");
+      assert.ok(position.right <= window.innerWidth - 152, "adaptive summary leaves the native window controls clear");
+      assert.ok(position.y >= 0 && position.bottom <= responsiveHeight, "adaptive height stays inside the titlebar");
+      assert.ok(Math.abs(position.height - responsiveHeight) <= 1, "adaptive outer height follows the entire titlebar");
+      const gapMidpoint = (228 + window.innerWidth - 152) / 2;
+      assert.ok(Math.abs(position.x + position.width / 2 - gapMidpoint) <= 3,
+        "content-sized summary is centered within the safe titlebar gap");
+    };
+    try {
+      window.document.body.prepend(responsiveBar);
+      for (const style of ["clear", "capsule", "stacked"]) {
+        window.innerWidth = 1600;
+        monitor = installStyledMonitor({ ...responsiveSettings, summaryStyle: style });
+        monitor.ensure();
+        const persistedBeforeResize = JSON.stringify(monitor.getSettings());
+        const saveCountBeforeResize = styleSaves.length;
+        assertResponsiveBounds();
+        assert.equal(visibleEntries().length, 5, `${style}: a wide window shows every selected metric`);
+        assert.equal(host.shadowRoot.querySelector(".usage-summary-overflow").hidden, true);
+        assert.ok(host.getBoundingClientRect().width < 800, "content-sized summary does not fill the available blank bar");
+
+        window.innerWidth = 620;
+        window.dispatchEvent(new window.Event("resize"));
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        assertResponsiveBounds();
+        assert.ok(visibleEntries().length < 5, `${style}: narrow windows fold secondary metrics`);
+        const core = styleItem("session", "contextUsage");
+        assert.equal(core.hidden, false, `${style}: context remains visible even when selected last`);
+        assert.equal(core.querySelector("[data-context-percent]").textContent, "46%");
+        assert.equal(core.querySelector("[data-context-summary]").textContent, "可继续", "folding keeps the complete context advice");
+        const overflow = host.shadowRoot.querySelector(".usage-summary-overflow");
+        assert.equal(overflow.hidden, false, "folded metrics have a visible details affordance");
+        assert.equal(Number(host.dataset.overflowCount), allEntries().filter((item) => item.hidden).length);
+        assert.equal(JSON.stringify(monitor.getSettings()), persistedBeforeResize, "fitting does not rewrite selected metrics or order");
+        assert.equal(styleSaves.length, saveCountBeforeResize, "window size changes do not save settings");
+        if (host.dataset.open === "true") host.shadowRoot.querySelector(".usage-summary").click();
+        overflow.click();
+        assert.equal(host.shadowRoot.querySelector(".usage-popover").hidden, false, "ellipsis opens the existing full details panel");
+        for (const item of allEntries().filter((item) => item.hidden)) {
+          const detailSelection = host.shadowRoot.querySelector(`.usage-detail-row input[data-source="${item.dataset.source}"][data-metric="${item.dataset.metric}"]`);
+          assert.ok(detailSelection?.checked, "folding keeps the metric selected and accessible in details");
+        }
+        host.shadowRoot.querySelector(".usage-summary").dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+        assert.equal(host.shadowRoot.querySelector(".usage-popover").hidden, true, "folded summary retains keyboard toggle behavior");
+
+        responsiveHeight = 64;
+        const titlebarObserver = resizeObservers.findLast((observer) => observer.nodes.has(responsiveBar));
+        assert.ok(titlebarObserver, "native titlebar size changes are observed independently of window resize");
+        titlebarObserver.callback([{ target: responsiveBar }]);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        assertResponsiveBounds();
+        responsiveHeight = 48;
+        window.innerWidth = 1600;
+        window.dispatchEvent(new window.Event("resize"));
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        assertResponsiveBounds();
+        assert.equal(visibleEntries().length, 5, `${style}: widening the window restores every selected metric`);
+        assert.equal(host.shadowRoot.querySelector(".usage-summary-overflow").hidden, true);
+        assert.equal(JSON.stringify(monitor.getSettings()), persistedBeforeResize);
+      }
+
+      window.innerWidth = 620;
+      monitor = installStyledMonitor({ ...responsiveSettings, summaryStyle: "capsule", englishUi: true, minimalMode: true });
+      monitor.ensure();
+      assertResponsiveBounds();
+      assert.equal(styleItem("session", "contextUsage").hidden, false, "English/minimal mode preserves the context core");
+      assert.match(styleItem("session", "contextUsage").querySelector("[data-context-summary]").textContent, /continue/i);
+      assert.ok(visibleEntries().length < 5);
+
+      const withoutContext = { ...responsiveSettings, metrics: { session: ["contextCompactions"], official: ["secondaryRemaining", "primaryReset"], "reset-forecast": ["probability48h"] } };
+      monitor = installStyledMonitor(withoutContext);
+      monitor.ensure();
+      assert.equal(allEntries()[0].hidden, false, "without context selected the first selected metric remains visible");
+      assert.ok(visibleEntries().length < 4);
+
+      monitor = installStyledMonitor(responsiveSettings);
+      window.innerWidth = 500;
+      monitor.ensure();
+      assert.equal(host.dataset.placement, "composer", "a titlebar too narrow for the protected core uses the safe composer fallback");
+      assert.equal(host.style.getPropertyValue("--usage-host-height"), "", "fallback removes the titlebar-specific height");
+      assert.equal(allEntries().some((item) => item.hidden), false, "fallback restores folded entries for the existing composer layout");
+      assert.equal(host.shadowRoot.querySelector(".usage-summary-overflow").hidden, true);
+      window.innerWidth = 1600;
+      monitor = installStyledMonitor({ ...responsiveSettings, metrics: { session: ["contextUsage"], official: [], "reset-forecast": [] } });
+      monitor.ensure();
+      assertResponsiveBounds();
+      assert.equal(visibleEntries().length, 1);
+      assert.ok(host.getBoundingClientRect().width < 200, "selecting only the context core produces a shorter centered monitor");
+      assert.equal(monitor.cleanup(), true);
+      assert.equal(window.document.getElementById("codex-usage-monitor"), null, "adaptive titlebar is removed by normal cleanup");
+      assert.ok(resizeObservers.every((observer) => observer.disconnected), "cleanup disconnects all responsive size observers");
+    } finally {
+      responsiveBar.remove();
+      window.innerWidth = responsiveWidth;
+      window.Element.prototype.getBoundingClientRect = originalElementBox;
+      window.__CODEX_USAGE_MONITOR_STATE__?.cleanup();
+      if (originalResizeObserver) Object.defineProperty(window, "ResizeObserver", originalResizeObserver);
+      else delete window.ResizeObserver;
     }
   } finally {
     window.__CODEX_USAGE_MONITOR_STATE__?.cleanup();
