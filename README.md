@@ -1,8 +1,8 @@
-# CtxMeter · M
+# CtxMeter · S
 
 <img src="docs/images/ctxmeter-icon.png" width="80" alt="CtxMeter 的 M 图标">
 
-Windows 版 Codex Desktop 的顶部上下文与用量监视器，使用 **M** 作为紧凑标识。产品版本 **1.2.0**，完整维护编号 **1.2.0+ctx.1**。提供三种可切换的顶部样式、上下文提醒及用量统计。
+Windows 版 Codex Desktop 的顶部上下文与用量监视器，默认使用 **S** 作为紧凑标识，桌面图标保留 **M**。产品版本 **1.2.1**，完整维护编号 **1.2.1+ctx.1**。提供三种可切换的顶部样式、上下文提醒及用量统计。
 
 [下载最新安装包](https://github.com/mingze21/CtxMeter/releases/latest) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/mingze21/CtxMeter/issues)
 
@@ -26,7 +26,7 @@ Windows 版 Codex Desktop 的顶部上下文与用量监视器，使用 **M** �
 
 - **Codex Usage Monitor for Windows**：以 [JiaYang-BUAA/Codex-Desktop-Usage-Monitor-Windows v3.1.7](https://github.com/JiaYang-BUAA/Codex-Desktop-Usage-Monitor-Windows) 为代码基础，延续用量采集、订阅额度、设置面板及 Windows 启动流程。
 - **[Nudge](https://github.com/yuxinz77/nudge-ai)**：借鉴紧凑上下文进度指示、红黄绿状态，以及及时保存结论和切换会话的提醒思路。本项目中的相关功能在现有监视器基础上实现，未打包 Nudge 的程序、源码、图标或品牌素材。
-- **本项目改进**：顶部布局、当前聊天上下文估算、中文行动提示、统一状态色、三种可选样式、数字与重置时间的可读性，以及独立的 M 标识、图标和手动更新策略。
+- **本项目改进**：顶部布局、当前聊天上下文估算、中文行动提示、统一状态色、三种可选样式、数字与重置时间的可读性，以及可自行修改的顶部 S 标识、独立 M 图标和手动更新策略。
 
 感谢原项目与相关工具带来的启发。代码继承、第三方数据来源和许可证记录见 [NOTICE.md](NOTICE.md)。
 
@@ -47,7 +47,7 @@ Windows 版 Codex Desktop 的顶部上下文与用量监视器，使用 **M** �
 
 需要 Windows 10/11、Codex Desktop、Node.js 22 或更高版本，以及 PowerShell。建议使用 PowerShell 7。
 
-1. 从 [v1.2.0 Releases](https://github.com/mingze21/CtxMeter/releases/tag/v1.2.0) 下载 `ctxmeter-1.2.0.zip`（安装包，而非 GitHub 自动生成的 Source code），用同页 `.sha256` 文件核验后解压，阅读 [AGENTS.md](AGENTS.md)。
+1. 从 [v1.2.1 Releases](https://github.com/mingze21/CtxMeter/releases/tag/v1.2.1) 下载 `ctxmeter-1.2.1.zip`（安装包，而非 GitHub 自动生成的 Source code），用同页 `.sha256` 文件核验后解压，阅读 [AGENTS.md](AGENTS.md)。
 2. 在解压目录执行：
 
    ```powershell
@@ -65,7 +65,7 @@ Windows 版 Codex Desktop 的顶部上下文与用量监视器，使用 **M** �
 默认程序目录：
 
 ```text
-%LOCALAPPDATA%\Programs\CtxMeter\1.2.0
+%LOCALAPPDATA%\Programs\CtxMeter\1.2.1
 ```
 
 安装器不会强制关闭或重启 Codex，也不会改动 WindowsApps、`app.asar`、登录文件、模型设置或原生 Codex 快捷方式。标题栏没有足够空间时，会回退到输入区域附近。
@@ -79,6 +79,16 @@ Windows 版 Codex Desktop 的顶部上下文与用量监视器，使用 **M** �
 - **上下两层**：每项上方显示标签、下方显示数值，适配标题栏可用空间。
 
 选择立即生效，并随原有设置保存，重新启动后恢复。旧设置和无效选项默认使用“清晰分层”。样式选择不改变指标口径、勾选顺序或上下文阈值；极简模式仍可用于隐藏一般指标标签。上下文沿用红黄绿，剩余额度采用蓝色，普通计数使用深色，重置时间加粗；深色主题使用相应的浅色数值。
+
+## 自定义顶部字母
+
+顶部默认显示 **S**，可以改为自己喜欢的字母。打开解压目录中的 `assets/usage-constants.js`，找到并修改：
+
+```javascript
+TOPBAR_MARK: "S",
+```
+
+例如把 `"S"` 改为 `"A"`，保存后重新运行该目录中的 `install.ps1`，再通过桌面 **CtxMeter** 快捷方式启动。当前 Codex 会话不便退出时，可按[故障排查指南](docs/troubleshooting.md)中的后台替换方式刷新监视器。字母修改不影响上下文指标、状态颜色或桌面的 M 图标；后续安装新版时需重新应用自己的字母修改。
 
 ## 本会话与其他指标
 
@@ -104,7 +114,7 @@ Windows 版 Codex Desktop 的顶部上下文与用量监视器，使用 **M** �
 
 本产品采用**手动更新**：不会检查、下载或安装原项目的发布包，避免覆盖定制功能。源码中保留的旧更新模块仅用于兼容性测试，监视器运行入口不加载它们；旧 `updateNotifications` 设置不会触发更新。
 
-完整维护编号及直接修改基线记录在 `BUILD-INFO.json`；本次 `1.2.0+ctx.1` 直接基于公开发布准备版 `1.1.0+sean.2`，统一为 CtxMeter 名称、M 标识、新图标、安装目录及包名，保留已有功能和配置兼容。历史维护编号保留原样，用于追溯继承关系。不要用版本号大小判断不同产品分支的新旧，也不要用原项目更新包覆盖本产品。
+完整维护编号及直接修改基线记录在 `BUILD-INFO.json`；本次 `1.2.1+ctx.1` 的顶部样式直接继承自用 S 版 `1.2.0+ctx.local.1`，该版基于上一公开版 `1.2.0+ctx.1`。本次将顶部 S 统一为公开默认值，增加字母修改入口与说明，保留 CtxMeter 名称、M 桌面图标、已有功能和配置兼容。历史维护编号保留原样，用于追溯继承关系。不要用版本号大小判断不同产品分支的新旧，也不要用原项目更新包覆盖本产品。
 
 ## 开发、测试与打包
 
@@ -114,6 +124,6 @@ pwsh -NoProfile -File .\tests\run-tests.ps1
 pwsh -NoProfile -File .\scripts\build-release.ps1
 ```
 
-打包输出 `dist\ctxmeter-1.2.0.zip`。仅包含清单允许的源码、图标和文档，不包含用户凭据、运行日志、Node.js 或 Codex 二进制文件。
+打包输出 `dist\ctxmeter-1.2.1.zip`。仅包含清单允许的源码、图标和文档，不包含用户凭据、运行日志、Node.js 或 Codex 二进制文件。
 
 需要停止监视器并移除当前页面显示时，执行 `scripts\restore-monitor.ps1`；该命令不终止 Codex。故障排查和不重启 Codex 的后台替换方式见 [故障排查指南](docs/troubleshooting.md)。

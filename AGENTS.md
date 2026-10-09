@@ -92,7 +92,7 @@ Do not replace the normal Codex shortcut. Do not modify `WindowsApps`, `app.asar
 
 ## Product Identity And Compatibility
 
-- Product name: CtxMeter; compact visual mark: M. VERSION and npm package versions must match the product release. BUILD-INFO.json records the full maintenance identifier and direct customization baseline; local deployment records must not be bundled. Preserve historical maintenance identifiers when documenting the release lineage.
+- Product name: CtxMeter; default compact visual mark: S; desktop icon: M. The topbar letter is customized through TOPBAR_MARK in assets/usage-constants.js. VERSION and npm package versions must match the product release. BUILD-INFO.json records the full maintenance identifier and direct customization baseline; local deployment records must not be bundled. Preserve historical maintenance identifiers when documenting the release lineage.
 - Preserve LICENSE and NOTICE.md, including upstream copyright and license attribution; these are legal records, not product branding.
 - Keep the existing CodexUsageMonitor state directory, DPAPI entropy, environment-variable names, DOM IDs and protocol identifiers for compatibility. Do not migrate or expose user credentials while rebranding.
 - New packages use ctxmeter-<VERSION>.zip and install under Programs\CtxMeter.
